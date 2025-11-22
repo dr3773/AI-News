@@ -1,293 +1,179 @@
 import os
-import html
-import logging
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
 from datetime import time
 from zoneinfo import ZoneInfo
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+import feedparser
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, ContextTypes
 
-# ------------------ НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ------------------ #
-
+# ====== НАСТРОЙКИ ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
-
-if CHANNEL_ID_ENV is None:
-    raise RuntimeError("Не задана переменная окружения CHANNEL_ID")
-
-try:
-    CHANNEL_ID = int(CHANNEL_ID_ENV)
-except ValueError:
-    raise RuntimeError("CHANNEL_ID должен быть целым числом (например, -1003238891648)")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # строка из переменной окружения
 
 if not TOKEN:
-    raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
+    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
+if not CHANNEL_ID:
+    raise RuntimeError("Не найден CHANNEL_ID в переменных окружения")
 
-# Часовой пояс – Душанбе
-DUSHANBE_TZ = ZoneInfo("Asia/Dushanbe")
+CHANNEL_ID = int(CHANNEL_ID)
 
-# Лента новостей (Google News по запросу 'искусственный интеллект')
-AI_NEWS_RSS = (
-    "https://news.google.com/rss/search?"
-    "q=%D0%B8%D1%81%D0%BA%D1%83%D1%81%D1%81%D1%82%D0%B2%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9+%D0%B8%D0%BD%D1%82%D0%B5%D0%BB%D0%BB%D0%B5%D0%BA%D1%82&"
-    "hl=ru&gl=RU&ceid=RU:ru"
-)
-
-MAX_ITEMS = 5  # сколько новостей брать в один дайджест
-
-# --------------------------- ЛОГИРОВАНИЕ --------------------------- #
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# RSS-ленты по ИИ (можно добавить ещё при желании)
+RSS_FEEDS = [
+    "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
+    "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
+]
 
 
-# ------------------------- РАБОТА С НОВОСТЯМИ ------------------------- #
-
-def fetch_ai_news(max_items: int = MAX_ITEMS):
+def extract_image(entry) -> str | None:
     """
-    Забирает новости по ИИ из Google News RSS.
-    Возвращает список словарей: {"title": ..., "url": ..., "source": ...}
+    Достаём картинку из RSS-записи, если она есть.
+    Для Google News обычно лежит в media_content.
     """
-    logger.info("Загружаю новости из RSS...")
+    # Вариант 1: media_content
+    media = getattr(entry, "media_content", None)
+    if media and isinstance(media, list):
+        url = media[0].get("url")
+        if url:
+            return url
 
-    try:
-        with urllib.request.urlopen(AI_NEWS_RSS, timeout=10) as response:
-            data = response.read()
-    except urllib.error.URLError as e:
-        logger.error("Ошибка при загрузке RSS: %s", e)
-        return []
+    # Вариант 2: ссылки типа image/*
+    links = getattr(entry, "links", [])
+    for l in links:
+        if l.get("type", "").startswith("image/") and l.get("href"):
+            return l["href"]
 
-    try:
-        root = ET.fromstring(data)
-    except ET.ParseError as e:
-        logger.error("Ошибка при разборе RSS: %s", e)
-        return []
+    return None
 
-    channel = root.find("channel")
-    if channel is None:
-        return []
 
-    items = []
-    for item in channel.findall("item")[:max_items]:
-        title_el = item.find("title")
-        link_el = item.find("link")
-        source_el = item.find("{http://www.w3.org/2005/Atom}source") or item.find(
-            "{http://search.yahoo.com/mrss/}source"
-        )
+def fetch_ai_news(limit: int = 3):
+    """
+    Собираем новости по ИИ из нескольких RSS-лент.
+    Возвращаем список словарей: title, url, image, source.
+    """
+    items: list[dict] = []
 
-        title = title_el.text if title_el is not None else "Без названия"
-        url = link_el.text if link_el is not None else ""
-        source = source_el.text if source_el is not None else ""
+    for feed_url in RSS_FEEDS:
+        parsed = feedparser.parse(feed_url)
+        source_title = parsed.feed.get("title", "Новости ИИ")
 
-        if not url:
+        for entry in parsed.entries:
+            title = entry.get("title")
+            link = entry.get("link")
+            if not title or not link:
+                continue
+
+            image = extract_image(entry)
+            items.append(
+                {
+                    "title": title,
+                    "url": link,
+                    "image": image,
+                    "source": source_title,
+                }
+            )
+
+    # Удаляем дубли по ссылке, оставляем первые limit штук
+    seen = set()
+    unique_items = []
+    for it in items:
+        if it["url"] in seen:
             continue
+        seen.add(it["url"])
+        unique_items.append(it)
+        if len(unique_items) >= limit:
+            break
 
-        items.append(
-            {
-                "title": title,
-                "url": url,
-                "source": source or "Источник",
-            }
-        )
-
-    logger.info("Успешно получено %d новостей", len(items))
-    return items
+    return unique_items
 
 
-def build_other_items_block(items):
+async def send_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Собираем текстовый блок для остальных новостей (без превью),
-    с короткими ссылками 'Читать новость'.
+    Универсальный отправщик дайджеста.
+    Название (утренний/дневной/вечерний) берём из context.job.data["label"].
     """
-    if len(items) <= 1:
-        return ""
+    label: str = context.job.data.get("label", "Дайджест ИИ")
 
-    lines = ["\n📌 Другие материалы по теме:\n"]
-    for i, item in enumerate(items[1:], start=2):
-        title = html.escape(item["title"])
-        source = html.escape(item["source"])
-        url = item["url"]
-        lines.append(
-            f"{i}. <b>{title}</b>\n"
-            f"{source}\n"
-            f'<a href="{url}">Читать новость</a>\n'
-        )
+    news = fetch_ai_news(limit=3)
 
-    return "\n".join(lines)
-
-
-# --------------------------- JOB-ФУНКЦИИ --------------------------- #
-
-async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str, emoji: str) -> None:
-    """
-    Отправляет один дайджест:
-    1) Заголовок
-    2) Главная новость с превью (будет картинка, если сайт даёт)
-    3) Блок из остальных новостей без превью, с красивыми короткими ссылками
-    """
-    logger.info("Отправляю %s дайджест ИИ...", period_title)
-    items = fetch_ai_news()
-
-    if not items:
+    if not news:
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=(
-                f"⚠️ Не удалось получить свежие новости по искусственному интеллекту "
-                f"для блока «{period_title}».\n"
-                f"Похоже, источник временно недоступен. Попробуем ещё раз позже."
-            ),
+            text=f"⚠️ {label}\nСегодня свежих новостей по ИИ не нашлось.",
         )
         return
 
-    # 1) Заголовок дайджеста
-    header = (
-        f"{emoji} <b>{period_title} дайджест новостей ИИ</b>\n\n"
-        f"Свежие материалы об искусственном интеллекте за последние часы:"
-    )
+    # Заголовок выпуска
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
-        text=header,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+        text=f"🤖 {label}\nПодборка свежих новостей об искусственном интеллекте:",
     )
 
-    # 2) Главная новость с превью
-    main_item = items[0]
-    main_title = html.escape(main_item["title"])
-    main_source = html.escape(main_item["source"])
-    main_url = main_item["url"]
+    # Каждую новость отправляем отдельным сообщением с кнопкой
+    for i, item in enumerate(news, start=1):
+        title = item["title"]
+        url = item["url"]
+        image = item["image"]
+        source = item["source"]
 
-    main_text = (
-        f"1. <b>{main_title}</b>\n"
-        f"{main_source}\n"
-        f"{main_url}"
-    )
+        caption = f"{i}. {title}\n📎 Источник: {source}"
+        # Ограничение Telegram на длину подписи
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
 
-    # Тут превью НЕ отключаем → Telegram сам подтянет картинку
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=main_text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=False,
-    )
-
-    # 3) Остальные новости — одной красивой простынёй, без превью
-    other_block = build_other_items_block(items)
-    if other_block:
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=other_block,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Читать полностью 📖", url=url)]]
         )
 
-    # 4) Завершающее сообщение
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text="Спасибо, что вы с нами — @AI_News3773",
-        disable_web_page_preview=True,
-    )
+        if image:
+            # Пытаемся отправить с фото
+            try:
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=image,
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+                continue
+            except Exception:
+                # Если с фото проблема — падаем в текстовый вариант
+                pass
+
+        # Текстовый вариант
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=caption,
+            reply_markup=keyboard,
+        )
 
 
-async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Утренний", "🌅")
+async def main() -> None:
+    app = Application.builder().token(TOKEN).build()
 
+    tz = ZoneInfo("Asia/Dushanbe")
 
-async def send_noon(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Дневной", "☀️")
+    # 5 выпусков в день
+    schedule = [
+        ("Утренний дайджест ИИ", time(9, 0, tzinfo=tz)),
+        ("Дневной дайджест ИИ", time(12, 0, tzinfo=tz)),
+        ("Дневной дайджест ИИ", time(15, 0, tzinfo=tz)),
+        ("Вечерний дайджест ИИ", time(18, 0, tzinfo=tz)),
+        ("Ночной дайджест ИИ", time(21, 0, tzinfo=tz)),
+    ]
 
+    for label, t in schedule:
+        app.job_queue.run_daily(
+            send_digest,
+            time=t,
+            data={"label": label},
+            name=label,
+        )
 
-async def send_afternoon(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Послеобеденный", "📰")
-
-
-async def send_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Вечерний", "🌇")
-
-
-async def send_night(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Ночной итоговый", "🌙")
-
-
-# --------------------------- ОБРАБОТЧИКИ КОМАНД --------------------------- #
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start — приветствие, если написать боту в личку.
-    """
-    await update.message.reply_text(
-        "Привет! Я бот канала AI News Digest.\n"
-        "Я автоматически отправляю ИИ-дайджест в канал 5 раз в день: "
-        "в 09:00, 12:00, 15:00, 18:00 и 21:00 по Душанбе."
-    )
-
-
-async def cmd_test_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /test_digest — тестовый дайджест в чат, где вызвали команду.
-    """
-    class DummyCtx:
-        bot = context.bot
-
-    await send_digest(DummyCtx(), "Тестовый", "🧪")
-
-
-# ------------------------------- MAIN ------------------------------- #
-
-def main() -> None:
-    logger.info("Запуск AI News бота...")
-
-    application = Application.builder().token(TOKEN).build()
-
-    # Команды для теста
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("test_digest", cmd_test_digest))
-
-    jq = application.job_queue
-
-    # 5 автодайджестов в день по Душанбе
-    jq.run_daily(
-        send_morning,
-        time=time(9, 0, tzinfo=DUSHANBE_TZ),
-        name="morning_ai_digest",
-    )
-    jq.run_daily(
-        send_noon,
-        time=time(12, 0, tzinfo=DUSHANBE_TZ),
-        name="noon_ai_digest",
-    )
-    jq.run_daily(
-        send_afternoon,
-        time=time(15, 0, tzinfo=DUSHANBE_TZ),
-        name="afternoon_ai_digest",
-    )
-    jq.run_daily(
-        send_evening,
-        time=time(18, 0, tzinfo=DUSHANBE_TZ),
-        name="evening_ai_digest",
-    )
-    jq.run_daily(
-        send_night,
-        time=time(21, 0, tzinfo=DUSHANBE_TZ),
-        name="night_ai_digest",
-    )
-
-    logger.info("Бот запущен. Ожидаю события и расписание.")
-    application.run_polling(close_loop=False)
+    # Разрешаем только служебные обновления, чтобы не ловить лишние сообщения
+    await app.run_polling(allowed_updates=[])
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
 
+    asyncio.run(main())
 
