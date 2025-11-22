@@ -143,7 +143,8 @@ def main():
     app.run_polling(allowed_updates=[])
 
 
-if _ _name_ _ == "_ _main_ _":
+if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
 
