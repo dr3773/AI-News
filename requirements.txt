@@ -1,5 +1,4 @@
-python-telegram-bot==20.6
-feedparser==6.0.10
+python-telegram-bot==21.7
 tzdata
 
 
