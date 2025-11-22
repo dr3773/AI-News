@@ -105,13 +105,36 @@ def fetch_ai_news(max_items: int = MAX_ITEMS):
     return items
 
 
+def build_other_items_block(items):
+    """
+    Собираем текстовый блок для остальных новостей (без превью),
+    с короткими ссылками 'Читать новость'.
+    """
+    if len(items) <= 1:
+        return ""
+
+    lines = ["\n📌 Другие материалы по теме:\n"]
+    for i, item in enumerate(items[1:], start=2):
+        title = html.escape(item["title"])
+        source = html.escape(item["source"])
+        url = item["url"]
+        lines.append(
+            f"{i}. <b>{title}</b>\n"
+            f"{source}\n"
+            f'<a href="{url}">Читать новость</a>\n'
+        )
+
+    return "\n".join(lines)
+
+
 # --------------------------- JOB-ФУНКЦИИ --------------------------- #
 
-async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str) -> None:
+async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str, emoji: str) -> None:
     """
     Отправляет один дайджест:
     1) Заголовок
-    2) По одной новости в отдельном сообщении с превью-ссылкой (будет картинка)
+    2) Главная новость с превью (будет картинка, если сайт даёт)
+    3) Блок из остальных новостей без превью, с красивыми короткими ссылками
     """
     logger.info("Отправляю %s дайджест ИИ...", period_title)
     items = fetch_ai_news()
@@ -129,8 +152,8 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str) -> 
 
     # 1) Заголовок дайджеста
     header = (
-        f"🧠 <b>{period_title} дайджест новостей ИИ</b>\n\n"
-        f"Сегодняшние материалы об искусственном интеллекте:"
+        f"{emoji} <b>{period_title} дайджест новостей ИИ</b>\n\n"
+        f"Свежие материалы об искусственном интеллекте за последние часы:"
     )
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
@@ -139,27 +162,37 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str) -> 
         disable_web_page_preview=True,
     )
 
-    # 2) Каждую новость — отдельным сообщением с превью (картинка у каждой)
-    for i, item in enumerate(items, start=1):
-        title = html.escape(item["title"])
-        source = html.escape(item["source"])
-        url = item["url"]
+    # 2) Главная новость с превью
+    main_item = items[0]
+    main_title = html.escape(main_item["title"])
+    main_source = html.escape(main_item["source"])
+    main_url = main_item["url"]
 
-        text = (
-            f"{i}. <b>{title}</b>\n"
-            f"{source}\n"
-            f"{url}"
-        )
+    main_text = (
+        f"1. <b>{main_title}</b>\n"
+        f"{main_source}\n"
+        f"{main_url}"
+    )
 
-        # ВАЖНО: не отключаем превью, чтобы Telegram показывал фото
+    # Тут превью НЕ отключаем → Telegram сам подтянет картинку
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=main_text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False,
+    )
+
+    # 3) Остальные новости — одной красивой простынёй, без превью
+    other_block = build_other_items_block(items)
+    if other_block:
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=text,
+            text=other_block,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
+            disable_web_page_preview=True,
         )
 
-    # Завершающее сообщение
+    # 4) Завершающее сообщение
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text="Спасибо, что вы с нами — @AI_News3773",
@@ -168,23 +201,23 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, period_title: str) -> 
 
 
 async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Утренний")
+    await send_digest(context, "Утренний", "🌅")
 
 
 async def send_noon(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Дневной")
+    await send_digest(context, "Дневной", "☀️")
 
 
 async def send_afternoon(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Послеобеденный")
+    await send_digest(context, "Послеобеденный", "📰")
 
 
 async def send_evening(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Вечерний"
+    await send_digest(context, "Вечерний", "🌇")
 
 
 async def send_night(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_digest(context, "Ночной итоговый")
+    await send_digest(context, "Ночной итоговый", "🌙")
 
 
 # --------------------------- ОБРАБОТЧИКИ КОМАНД --------------------------- #
@@ -207,7 +240,7 @@ async def cmd_test_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     class DummyCtx:
         bot = context.bot
 
-    await send_digest(DummyCtx(), "Тестовый")
+    await send_digest(DummyCtx(), "Тестовый", "🧪")
 
 
 # ------------------------------- MAIN ------------------------------- #
@@ -256,6 +289,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
