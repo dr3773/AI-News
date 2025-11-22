@@ -148,9 +148,8 @@ async def main():
         )
 
     await app.run_polling(allowed_updates=[])
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+import asyncio
+asyncio.run(main())
 
 
 
