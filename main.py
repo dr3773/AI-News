@@ -76,7 +76,7 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHANNEL_ID, text=build_evening_digest())
 
 
-async def main():
+def main():
     app = Application.builder().token(TOKEN).build()
 
     tz = ZoneInfo("Asia/Dushanbe")
@@ -88,13 +88,9 @@ async def main():
     jq.run_daily(job_crypto, time=time(18, 0, tzinfo=tz))
     jq.run_daily(job_evening, time=time(21, 0, tzinfo=tz))
 
-    await app.initialize()
-    await app.start()
-    await app.run_polling()
-    await app.stop()
-    await app.shutdown()
+    # run_polling сам создаёт и управляет event loop
+    app.run_polling(stop_signals=None)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
