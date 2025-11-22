@@ -114,8 +114,8 @@ async def main():
 
     schedule = [
         ("Утренний дайджест ИИ", time(9, 0, tzinfo=tz)),
-        ("Дайджест ИИ", time(12, 0, tzinfo=tz)),
-        ("Дайджест ИИ", time(15, 0, tzinfo=tz)),
+        ("Дневной дайджест ИИ", time(12, 0, tzinfo=tz)),
+        ("Дневной дайджест ИИ", time(15, 0, tzinfo=tz)),
         ("Вечерний дайджест ИИ", time(18, 0, tzinfo=tz)),
         ("Ночной дайджест ИИ", time(21, 0, tzinfo=tz)),
     ]
@@ -128,15 +128,9 @@ async def main():
             name=label,
         )
 
-    # ❗ НЕТ ПОЛЛИНГА ❗
-    # НЕ используем run_polling(), запускаем просто idle()
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()  # отключено, но updater нужен для job_queue
-    await app.idle()
+    await app.run_polling(allowed_updates=[])
 
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-
