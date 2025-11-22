@@ -1,6 +1,8 @@
 import os
+import asyncio
 from datetime import time
 from zoneinfo import ZoneInfo
+
 
 from telegram.ext import Application, ContextTypes
 
@@ -76,7 +78,7 @@ async def job_evening(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHANNEL_ID, text=build_evening_digest())
 
 
-def main():
+async def main():
     app = Application.builder().token(TOKEN).build()
 
     tz = ZoneInfo("Asia/Dushanbe")
@@ -88,9 +90,15 @@ def main():
     jq.run_daily(job_crypto, time=time(18, 0, tzinfo=tz))
     jq.run_daily(job_evening, time=time(21, 0, tzinfo=tz))
 
-    # run_polling сам создаёт и управляет event loop
-    app.run_polling(stop_signals=None)
+    await app.initialize()
+    await app.start()
+    print("AI News worker started. Jobs scheduled.")
+
+    # держим бота «живым», чтобы работали задания
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+
