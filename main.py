@@ -1,11 +1,10 @@
 import os
-import asyncio
 from datetime import time
 from zoneinfo import ZoneInfo
 
 import feedparser
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, ContextTypes, CommandHandler
 
 # ====== НАСТРОЙКИ ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -28,7 +27,7 @@ RSS_FEEDS = [
 def extract_image(entry) -> str | None:
     """
     Достаём картинку из RSS-записи, если она есть.
-    Для Google News она часто лежит в media_content или ссылках типа image/*.
+    Для Google News обычно лежит в media_content.
     """
     # Вариант 1: media_content
     media = getattr(entry, "media_content", None)
@@ -147,14 +146,13 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ====== КОМАНДА /test ДЛЯ ПРОВЕРКИ БОТА ======
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Бот работает 👍")
+
+
 async def main() -> None:
-    # ВАЖНО: отключаем updater, чтобы не было getUpdates и конфликтов.
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .updater(None)  # <-- вот это убирает long polling
-        .build()
-    )
+    app = Application.builder().token(TOKEN).build()
 
     tz = ZoneInfo("Asia/Dushanbe")
 
@@ -175,18 +173,15 @@ async def main() -> None:
             name=label,
         )
 
-    # Инициализируем и запускаем приложение БЕЗ polling
-    await app.initialize()
-    await app.start()
+    # Регистрируем команду /test
+    app.add_handler(CommandHandler("test", test_cmd))
 
-    print("AI News worker started and job queue is running")
-
-    # Держим процесс живым бесконечно
-    stop_event = asyncio.Event()
-    await stop_event.wait()
+    # Получаем только сообщения (для команд), этого достаточно
+    await app.run_polling(allowed_updates=["message"])
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
 
+    asyncio.run(main())
 
