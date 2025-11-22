@@ -1,17 +1,15 @@
 import os
+import asyncio
 from datetime import time
 from zoneinfo import ZoneInfo
 
 import feedparser
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, ContextTypes, CommandHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, ContextTypes
 
 # ====== НАСТРОЙКИ ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # строка из переменной окружения
-
-# Твой Telegram ID (из IDBot)
-OWNER_ID = 797726160
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
@@ -20,7 +18,7 @@ if not CHANNEL_ID:
 
 CHANNEL_ID = int(CHANNEL_ID)
 
-# RSS-ленты по ИИ
+# RSS-ленты по ИИ (можно добавить ещё при желании)
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
@@ -30,14 +28,16 @@ RSS_FEEDS = [
 def extract_image(entry) -> str | None:
     """
     Достаём картинку из RSS-записи, если она есть.
-    Для Google News обычно лежит в media_content.
+    Для Google News она часто лежит в media_content или ссылках типа image/*.
     """
+    # Вариант 1: media_content
     media = getattr(entry, "media_content", None)
     if media and isinstance(media, list):
         url = media[0].get("url")
         if url:
             return url
 
+    # Вариант 2: ссылки типа image/*
     links = getattr(entry, "links", [])
     for l in links:
         if l.get("type", "").startswith("image/") and l.get("href"):
@@ -87,10 +87,13 @@ def fetch_ai_news(limit: int = 3):
     return unique_items
 
 
-async def send_digest_for_label(label: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Отправляет дайджест с заданным заголовком label.
+    Универсальный отправщик дайджеста.
+    Название (утренний/дневной/вечерний) берём из context.job.data["label"].
     """
+    label: str = context.job.data.get("label", "Дайджест ИИ")
+
     news = fetch_ai_news(limit=3)
 
     if not news:
@@ -114,6 +117,7 @@ async def send_digest_for_label(label: str, context: ContextTypes.DEFAULT_TYPE) 
         source = item["source"]
 
         caption = f"{i}. {title}\n📎 Источник: {source}"
+        # Ограничение Telegram на длину подписи
         if len(caption) > 1024:
             caption = caption[:1020] + "…"
 
@@ -122,6 +126,7 @@ async def send_digest_for_label(label: str, context: ContextTypes.DEFAULT_TYPE) 
         )
 
         if image:
+            # Пытаемся отправить с фото
             try:
                 await context.bot.send_photo(
                     chat_id=CHANNEL_ID,
@@ -131,9 +136,10 @@ async def send_digest_for_label(label: str, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 continue
             except Exception:
-                # Если фото не получилось – отправляем просто текст
+                # Если с фото проблема — падаем в текстовый вариант
                 pass
 
+        # Текстовый вариант
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=caption,
@@ -141,28 +147,14 @@ async def send_digest_for_label(label: str, context: ContextTypes.DEFAULT_TYPE) 
         )
 
 
-# ====== JOB-ДЛЯ РАСПИСАНИЯ ======
-async def send_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    label: str = context.job.data.get("label", "Дайджест ИИ")
-    await send_digest_for_label(label, context)
-
-
-# ====== РУЧНОЙ ЗАПУСК /test ======
-async def test_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Разрешаем использовать только тебе
-    if update.effective_user is None or update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Команда доступна только владельцу бота.")
-        return
-
-    await update.message.reply_text("✅ Запускаю тестовый дайджест в канал...")
-    await send_digest_for_label("Тестовый дайджест ИИ (ручной запуск)", context)
-
-
-def main() -> None:
-    app = Application.builder().token(TOKEN).build()
-
-    # Команда /test в личке с ботом
-    app.add_handler(CommandHandler("test", test_digest))
+async def main() -> None:
+    # ВАЖНО: отключаем updater, чтобы не было getUpdates и конфликтов.
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .updater(None)  # <-- вот это убирает long polling
+        .build()
+    )
 
     tz = ZoneInfo("Asia/Dushanbe")
 
@@ -177,18 +169,24 @@ def main() -> None:
 
     for label, t in schedule:
         app.job_queue.run_daily(
-            send_digest_job,
+            send_digest,
             time=t,
             data={"label": label},
             name=label,
         )
 
-    # run_polling сам создаёт и закрывает event loop
-    app.run_polling()
+    # Инициализируем и запускаем приложение БЕЗ polling
+    await app.initialize()
+    await app.start()
+
+    print("AI News worker started and job queue is running")
+
+    # Держим процесс живым бесконечно
+    stop_event = asyncio.Event()
+    await stop_event.wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
-   
 
