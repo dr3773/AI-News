@@ -158,7 +158,7 @@ async def test_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_digest_for_label("Тестовый дайджест ИИ (ручной запуск)", context)
 
 
-async def main() -> None:
+def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
     # Команда /test в личке с ботом
@@ -183,13 +183,10 @@ async def main() -> None:
             name=label,
         )
 
-    # ВАЖНО: не указываем allowed_updates=[], чтобы команды /test доходили
-    await app.run_polling()
+    # run_polling сам создаёт и закрывает event loop
+    app.run_polling()
 
 
 
-    import asyncio
-
-    asyncio.run(main())
-
+    main()
 
