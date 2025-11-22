@@ -1,96 +1,139 @@
 import os
+import logging
 from datetime import time
 from zoneinfo import ZoneInfo
+from html import unescape
+from typing import List, Dict, Optional
+import urllib.request
+import xml.etree.ElementTree as ET
 
-import feedparser
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, ContextTypes, CommandHandler
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ====== НАСТРОЙКИ ======
+# ----------------- НАСТРОЙКИ -----------------
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # строка из переменной окружения
+CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
-if not CHANNEL_ID:
+if not CHANNEL_ID_ENV:
     raise RuntimeError("Не найден CHANNEL_ID в переменных окружения")
 
-CHANNEL_ID = int(CHANNEL_ID)
+CHANNEL_ID = int(CHANNEL_ID_ENV)
 
-# RSS-ленты по ИИ (можно добавить ещё при желании)
+# Google News RSS по ИИ (ru + en)
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-
-def extract_image(entry) -> str | None:
-    """
-    Достаём картинку из RSS-записи, если она есть.
-    Для Google News обычно лежит в media_content.
-    """
-    # Вариант 1: media_content
-    media = getattr(entry, "media_content", None)
-    if media and isinstance(media, list):
-        url = media[0].get("url")
-        if url:
-            return url
-
-    # Вариант 2: ссылки типа image/*
-    links = getattr(entry, "links", [])
-    for l in links:
-        if l.get("type", "").startswith("image/") and l.get("href"):
-            return l["href"]
-
-    return None
+# namespace для картинок в RSS (media:thumbnail / media:content)
+NS = {"media": "http://search.yahoo.com/mrss/"}
 
 
-def fetch_ai_news(limit: int = 3):
-    """
-    Собираем новости по ИИ из нескольких RSS-лент.
-    Возвращаем список словарей: title, url, image, source.
-    """
-    items: list[dict] = []
+# ----------------- РАБОТА С RSS -----------------
 
-    for feed_url in RSS_FEEDS:
-        parsed = feedparser.parse(feed_url)
-        source_title = parsed.feed.get("title", "Новости ИИ")
 
-        for entry in parsed.entries:
-            title = entry.get("title")
-            link = entry.get("link")
-            if not title or not link:
-                continue
+def _fetch_rss(url: str, limit: Optional[int] = None) -> List[Dict]:
+    """Скачиваем и разбираем один RSS-фид без сторонних библиотек."""
+    logger.info("Загружаю RSS: %s", url)
+    try:
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = resp.read()
+    except Exception as e:
+        logger.warning("Не удалось загрузить RSS %s: %s", url, e)
+        return []
 
-            image = extract_image(entry)
-            items.append(
-                {
-                    "title": title,
-                    "url": link,
-                    "image": image,
-                    "source": source_title,
-                }
-            )
+    try:
+        root = ET.fromstring(data)
+    except Exception as e:
+        logger.warning("Не удалось распарсить RSS %s: %s", url, e)
+        return []
 
-    # Удаляем дубли по ссылке, оставляем первые limit штук
-    seen = set()
-    unique_items = []
-    for it in items:
-        if it["url"] in seen:
+    channel_title = (
+        root.findtext("./channel/title") or
+        root.findtext(".//title") or
+        "Новости ИИ"
+    )
+
+    items: List[Dict] = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title")
+        link = item.findtext("link")
+
+        if not title or not link:
             continue
-        seen.add(it["url"])
-        unique_items.append(it)
-        if len(unique_items) >= limit:
+
+        title = unescape(title.strip())
+        link = link.strip()
+
+        # Пытаемся достать картинку
+        image = None
+        media_content = item.find("media:content", NS)
+        if media_content is not None:
+            image = media_content.get("url")
+
+        if not image:
+            media_thumb = item.find("media:thumbnail", NS)
+            if media_thumb is not None:
+                image = media_thumb.get("url")
+
+        items.append(
+            {
+                "title": title,
+                "url": link,
+                "image": image,
+                "source": channel_title,
+            }
+        )
+
+        if limit is not None and len(items) >= limit:
             break
 
-    return unique_items
+    return items
 
 
-async def _send_digest_impl(bot, label: str) -> None:
-    """
-    Общая функция отправки дайджеста.
-    Её используют и расписание, и команда /test.
-    """
+def fetch_ai_news(limit: int = 3) -> List[Dict]:
+    """Собираем новости по ИИ из нескольких RSS-лент, убираем дубли."""
+    all_items: List[Dict] = []
+
+    for feed in RSS_FEEDS:
+        all_items.extend(_fetch_rss(feed, limit=limit * 2))
+
+    seen_urls = set()
+    result: List[Dict] = []
+    for item in all_items:
+        url = item["url"]
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        result.append(item)
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+# ----------------- ОТПРАВКА ДАЙДЖЕСТА -----------------
+
+
+async def _do_send_digest(bot, label: str) -> None:
+    """Общая логика отправки дайджеста (и по расписанию, и по команде /test)."""
     news = fetch_ai_news(limit=3)
 
     if not news:
@@ -100,13 +143,13 @@ async def _send_digest_impl(bot, label: str) -> None:
         )
         return
 
-    # Заголовок выпуска
+    # Заголовок
     await bot.send_message(
         chat_id=CHANNEL_ID,
         text=f"🤖 {label}\nПодборка свежих новостей об искусственном интеллекте:",
     )
 
-    # Каждую новость отправляем отдельным сообщением с кнопкой
+    # Каждую новость — отдельным сообщением
     for i, item in enumerate(news, start=1):
         title = item["title"]
         url = item["url"]
@@ -114,7 +157,6 @@ async def _send_digest_impl(bot, label: str) -> None:
         source = item["source"]
 
         caption = f"{i}. {title}\n📎 Источник: {source}"
-        # Ограничение Telegram на длину подписи
         if len(caption) > 1024:
             caption = caption[:1020] + "…"
 
@@ -123,7 +165,6 @@ async def _send_digest_impl(bot, label: str) -> None:
         )
 
         if image:
-            # Пытаемся отправить с фото
             try:
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
@@ -132,11 +173,9 @@ async def _send_digest_impl(bot, label: str) -> None:
                     reply_markup=keyboard,
                 )
                 continue
-            except Exception:
-                # Если с фото проблема — падаем в текстовый вариант
-                pass
+            except Exception as e:
+                logger.warning("Не удалось отправить фото (%s), падаем в текст: %s", image, e)
 
-        # Текстовый вариант
         await bot.send_message(
             chat_id=CHANNEL_ID,
             text=caption,
@@ -144,40 +183,42 @@ async def _send_digest_impl(bot, label: str) -> None:
         )
 
 
-async def send_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Колбек для job_queue (расписание).
-    Название дайджеста берём из context.job.data["label"].
-    """
-    label: str = context.job.data.get("label", "Дайджест ИИ")
-    await _send_digest_impl(context.bot, label)
+async def send_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Функция для JobQueue (по расписанию)."""
+    label = context.job.data.get("label", "Дайджест ИИ")
+    await _do_send_digest(context.bot, label)
 
 
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Команда /test — вручную присылает дайджест в канал.
-    Работает и для тебя, и для подписчиков (если надо).
-    """
-    label = "Тестовый автодайджест ИИ (ручной запуск)"
-    await _send_digest_impl(context.bot, label)
+# ----------------- ХЕНДЛЕРЫ КОМАНД -----------------
 
-    # Ответ в личку, чтобы ты видел, что всё ок
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Тестовый дайджест отправлен в канал ✅"
-        )
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_chat.send_message(
+        "Привет! 👋\n\n"
+        "Это автоматический ИИ-дайджест.\n"
+        "Я буду публиковать подборки новостей по искусственному интеллекту "
+        "в канале AI News Digest.\n\n"
+        "Для теста можешь отправить команду /test."
+    )
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_chat.send_message("Запускаю тестовый дайджест…")
+    await _do_send_digest(context.bot, "Тестовый ИИ-дайджест")
+
+
+# ----------------- ЗАПУСК ПРИЛОЖЕНИЯ -----------------
 
 
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
-    # Команда /test
-    app.add_handler(CommandHandler("test", test_command))
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("test", cmd_test))
 
-    # Таймзона Душанбе
+    # Расписание (по времени Душанбе)
     tz = ZoneInfo("Asia/Dushanbe")
-
-    # 5 выпусков в день
     schedule = [
         ("Утренний дайджест ИИ", time(9, 0, tzinfo=tz)),
         ("Дневной дайджест ИИ", time(12, 0, tzinfo=tz)),
@@ -188,17 +229,22 @@ def main() -> None:
 
     for label, t in schedule:
         app.job_queue.run_daily(
-            send_digest,
+            send_digest_job,
             time=t,
             data={"label": label},
             name=label,
         )
 
-    # ВАЖНО: не передаём allowed_updates=[],
-    # чтобы команда /test тоже работала
+    # Один раз при старте — чтобы ты сразу увидел результат
+    async def on_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _do_send_digest(context.bot, "Стартовый ИИ-дайджест")
+
+    app.job_queue.run_once(on_startup, when=5)  # через 5 секунд после запуска
+
+    # Запуск бота (здесь уже свой цикл, без asyncio.run)
+    logger.info("Запускаю бота…")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
