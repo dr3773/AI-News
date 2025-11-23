@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from datetime import time, date
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ============ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ============
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
-ADMIN_ID_ENV = os.getenv("ADMIN_ID")  # твой Telegram ID (необязателен, но полезен)
+ADMIN_ID_ENV = os.getenv("ADMIN_ID")  # твой Telegram ID (опционален)
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
@@ -32,7 +33,7 @@ ADMIN_ID: Optional[int] = int(ADMIN_ID_ENV) if ADMIN_ID_ENV else None
 # Временная зона Душанбе
 TZ = ZoneInfo("Asia/Dushanbe")
 
-# ============ УМНЫЕ ИСТОЧНИКИ ИИ-НОВОСТЕЙ ============
+# ============ ИСТОЧНИКИ ИИ-НОВОСТЕЙ ============
 RSS_FEEDS: List[str] = [
     # Мир ИИ — англоязычные хедлайны
     (
@@ -65,22 +66,120 @@ NS = {"media": "http://search.yahoo.com/mrss/"}
 
 # ============ ПАМЯТЬ НА ДЕНЬ ============
 CURRENT_DAY: date = date.today()
-POSTED_URLS: set[str] = set()      # что уже публиковали (чтобы не спамить)
-DAILY_ITEMS: List[Dict] = []       # новости, вошедшие в дневные посты (для дайджеста)
+POSTED_URLS: set[str] = set()  # чтобы не дублировать
+DAILY_ITEMS: List[Dict] = []   # для вечернего дайджеста
 
 
 def reset_day_if_needed() -> None:
-    """Сбрасываем память, если начался новый день."""
+    """Сброс состояния, если наступил новый день."""
     global CURRENT_DAY, POSTED_URLS, DAILY_ITEMS
     today = date.today()
     if today != CURRENT_DAY:
-        logger.info("Наступил новый день, очищаю память новостей")
+        logger.info("Новый день — очищаю внутреннюю память новостей")
         CURRENT_DAY = today
         POSTED_URLS = set()
         DAILY_ITEMS = []
 
 
-# ============ ПАРСИНГ RSS БЕЗ feedparser ============
+# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ТЕКСТА ============
+
+def clean_html(text: str) -> str:
+    """Убираем HTML-теги и лишние пробелы."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def shorten_summary(text: str, max_len: int = 350) -> str:
+    """
+    Обрезаем описание до разумной длины (1–3 предложения).
+    """
+    if len(text) <= max_len:
+        return text
+
+    cut = text[:max_len]
+    last_dot = cut.rfind(".")
+    if last_dot > max_len * 0.5:
+        cut = cut[: last_dot + 1]
+    return cut.strip() + "…"
+
+
+# ============ КЛАССИФИКАЦИЯ И ИИ-КОММЕНТАРИИ ============
+
+def classify_category(title: str, summary: Optional[str]) -> str:
+    """
+    Простая классификация новости по ключевым словам,
+    чтобы ИИ-комментарий звучал осмысленно.
+    """
+    text = f"{title} {summary or ''}".lower()
+
+    if any(w in text for w in ["модель", "нейросеть", "нейросети", "transformer", "llm", "architecture"]):
+        return "модели и технологии ИИ"
+
+    if any(w in text for w in ["стартап", "startup", "инвестици", "funding", "оценка", "раунд", "venture"]):
+        return "стартапы и инвестиции в ИИ"
+
+    if any(w in text for w in ["министер", "регуляц", "regulation", "policy", "безопасност", "safety", "governance"]):
+        return "регулирование и безопасность ИИ"
+
+    if any(w in text for w in ["приложение", "сервис", "product", "assistant", "внедрили", "запустили"]):
+        return "прикладные продукты и сервисы на базе ИИ"
+
+    if any(w in text for w in ["медицина", "health", "diagnosis", "клиник", "пациент"]):
+        return "ИИ в медицине"
+
+    if any(w in text for w in ["образован", "education", "университет", "курс", "обучени"]):
+        return "ИИ в образовании"
+
+    return "общие тренды и развитие ИИ"
+
+
+def build_ai_comment(title: str, summary: Optional[str]) -> str:
+    """
+    Строим короткий «ИИ-комментарий» по категории.
+    """
+    category = classify_category(title, summary)
+
+    if category == "модели и технологии ИИ":
+        return (
+            "Разработчики продолжают усиливать сами модели. "
+            "Рост качества моделей определяет, какие новые задачи ИИ сможет решать в ближайшие месяцы."
+        )
+    if category == "стартапы и инвестиции в ИИ":
+        return (
+            "Рынок ИИ-стартапов остаётся активным. "
+            "Такие новости показывают, куда сейчас идут деньги и какие направления могут выстрелить через 1–3 года."
+        )
+    if category == "регулирование и безопасность ИИ":
+        return (
+            "Регуляторы всё серьёзнее относятся к ИИ. "
+            "Это влияет на скорость внедрения технологий и правила игры для компаний, которые разрабатывают модели."
+        )
+    if category == "прикладные продукты и сервисы на базе ИИ":
+        return (
+            "Компании всё активнее встраивают ИИ в реальные продукты. "
+            "Такие новости показывают, как ИИ становится частью повседневной жизни пользователей."
+        )
+    if category == "ИИ в медицине":
+        return (
+            "ИИ всё глубже проникает в медицину — от диагностики до поддержки врачебных решений. "
+            "Это направление может сильно изменить подход к лечению и работе клиник."
+        )
+    if category == "ИИ в образовании":
+        return (
+            "Образование — одно из ключевых направлений применения ИИ. "
+            "Такие новости показывают, как ИИ может ускорить обучение и сделать его более персонализированным."
+        )
+
+    return (
+        "Эта новость отражает общий тренд развития ИИ. "
+        "Важно отслеживать такие события, чтобы понимать, куда движется индустрия и какие темы будут ключевыми завтра."
+    )
+
+
+# ============ ПАРСИНГ RSS ============
+
 def _fetch_rss(url: str, limit: int = 30) -> List[Dict]:
     """Загружаем и парсим одну RSS-ленту Google News."""
     logger.info("Загружаю RSS: %s", url)
@@ -107,6 +206,7 @@ def _fetch_rss(url: str, limit: int = 30) -> List[Dict]:
     for item in root.findall(".//item"):
         title = item.findtext("title")
         link = item.findtext("link")
+        desc_raw = item.findtext("description")
 
         if not title or not link:
             continue
@@ -114,7 +214,12 @@ def _fetch_rss(url: str, limit: int = 30) -> List[Dict]:
         title = unescape(title.strip())
         link = link.strip()
 
-        # Пытаемся вытащить картинку (если понадобится в будущем)
+        summary: Optional[str] = None
+        if desc_raw:
+            summary_clean = clean_html(desc_raw)
+            if summary_clean:
+                summary = shorten_summary(summary_clean, max_len=350)
+
         image: Optional[str] = None
         media_content = item.find("media:content", NS)
         if media_content is not None:
@@ -131,6 +236,7 @@ def _fetch_rss(url: str, limit: int = 30) -> List[Dict]:
                 "url": link,
                 "image": image,
                 "source": channel_title,
+                "summary": summary,
             }
         )
 
@@ -142,7 +248,7 @@ def _fetch_rss(url: str, limit: int = 30) -> List[Dict]:
 
 def fetch_ai_news(limit: int = 100) -> List[Dict]:
     """
-    Собираем новости по ИИ из нескольких RSS-лент.
+    Собираем новости по ИИ из всех RSS-лент.
     Удаляем дубли по ссылке, возвращаем до limit штук.
     """
     all_items: List[Dict] = []
@@ -167,7 +273,7 @@ def fetch_ai_news(limit: int = 100) -> List[Dict]:
 def get_fresh_news(max_count: int = 3) -> List[Dict]:
     """
     Находит новые новости, которых ещё не было в POSTED_URLS.
-    max_count — максимум новостей за один проход (чтобы не заспамить).
+    max_count — максимум новостей за один проход.
     """
     all_news = fetch_ai_news(limit=100)
     fresh: List[Dict] = []
@@ -181,7 +287,8 @@ def get_fresh_news(max_count: int = 3) -> List[Dict]:
     return fresh
 
 
-# ============ ВСПОМОГАТЕЛЬНОЕ ============
+# ============ ОТЧЁТ АДМИНУ ============
+
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Отправить сообщение админу, если ADMIN_ID задан."""
     if ADMIN_ID is None:
@@ -192,25 +299,45 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         logger.warning("Не удалось отправить сообщение админу: %s", e)
 
 
+# ============ ПУБЛИКАЦИЯ ОДНОЙ НОВОСТИ ============
+
 async def send_single_news(context: ContextTypes.DEFAULT_TYPE, item: Dict) -> None:
     """
     Публикует одну новость в канал:
     - заголовок
-    - строка с кликабельным источником
+    - краткий текст (если есть)
+    - источник-ссылка
+    - ИИ-комментарий «что это значит»
     """
     title = item["title"]
     url = item["url"]
     source = item["source"]
+    summary = item.get("summary")
 
     safe_url = html_escape(url, quote=True)
     safe_source = html_escape(source, quote=True)
 
-    text = (
-        f"📰 {title}\n\n"
-        f'📎 Источник: <a href="{safe_url}">{safe_source}</a>'
-    )
+    parts: List[str] = []
 
-    # Ограничение по длине
+    # Заголовок
+    parts.append(f"📰 {html_escape(title, quote=False)}")
+
+    # Краткое описание, если есть
+    if summary:
+        parts.append("")
+        parts.append(html_escape(summary, quote=False))
+
+    # Источник
+    parts.append("")
+    parts.append(f'📎 Источник: <a href="{safe_url}">{safe_source}</a>')
+
+    # ИИ-комментарий
+    ai_comment = build_ai_comment(title, summary)
+    parts.append("")
+    parts.append(f"🤖 Что это значит: {html_escape(ai_comment, quote=False)}")
+
+    text = "\n".join(parts)
+
     if len(text) > 4096:
         text = text[:4090] + "…"
 
@@ -218,17 +345,18 @@ async def send_single_news(context: ContextTypes.DEFAULT_TYPE, item: Dict) -> No
         chat_id=CHANNEL_ID,
         text=text,
         parse_mode="HTML",
-        disable_web_page_preview=False,  # пусть Telegram сам покажет превью, если есть
+        disable_web_page_preview=False,
     )
 
 
 # ============ ПЕРИОДИЧЕСКАЯ ПРОВЕРКА НОВОСТЕЙ ============
+
 async def check_and_post_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Каждые N минут:
     - обновляем день
     - ищем новые новости
-    - публикуем до 3 новых штук сразу
+    - публикуем до 3 новых штук
     """
     reset_day_if_needed()
 
@@ -240,7 +368,6 @@ async def check_and_post_news(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not fresh_news:
-        # просто молчим, без спама
         logger.info("Новых новостей не найдено")
         return
 
@@ -258,6 +385,7 @@ async def check_and_post_news(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ============ ВЕЧЕРНИЙ ДАЙДЖЕСТ В 21:00 ============
+
 async def send_evening_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     В 21:00 отправляем один дайджест всех новостей за день.
@@ -272,16 +400,29 @@ async def send_evening_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    lines = ["🧠 <b>Вечерний дайджест ИИ — главное за сегодня</b>\n"]
-    for i, item in enumerate(DAILY_ITEMS, start=1):
-        safe_url = html_escape(item["url"], quote=True)
-        safe_source = html_escape(item["source"], quote=True)
-        title = html_escape(item["title"], quote=False)
+    lines: List[str] = []
+    lines.append("🧠 <b>Вечерний дайджест ИИ — главное за сегодня</b>\n")
 
-        lines.append(
-            f"{i}. {title}\n"
-            f'   📎 <a href="{safe_url}">{safe_source}</a>\n'
-        )
+    for i, item in enumerate(DAILY_ITEMS, start=1):
+        title = item["title"]
+        url = item["url"]
+        source = item["source"]
+        summary = item.get("summary")
+
+        safe_url = html_escape(url, quote=True)
+        safe_source = html_escape(source, quote=True)
+        safe_title = html_escape(title, quote=False)
+        safe_summary = html_escape(summary, quote=False) if summary else None
+
+        ai_comment = build_ai_comment(title, summary)
+        safe_ai_comment = html_escape(ai_comment, quote=False)
+
+        lines.append(f"{i}. {safe_title}")
+        if safe_summary:
+            lines.append(f"   {safe_summary}")
+        lines.append(f'   📎 <a href="{safe_url}">{safe_source}</a>')
+        lines.append(f"   🤖 Что это значит: {safe_ai_comment}")
+        lines.append("")
 
     text = "\n".join(lines)
 
@@ -292,34 +433,37 @@ async def send_evening_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         disable_web_page_preview=True,
     )
 
-    # после дайджеста очищаем только список дайджеста,
-    # POSTED_URLS оставляем, чтобы не дублировать при перезапусках в тот же день
     DAILY_ITEMS.clear()
-    logger.info("Вечерний дайджест отправлен и DAILY_ITEMS очищен")
+    logger.info("Вечерний дайджест отправлен, DAILY_ITEMS очищен")
 
 
-# ============ MAIN ============
+# ============ ЗАПУСК БОТА ============
 
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
-    # ✅ каждые 15 минут проверяем новости и сразу постим новые
+    # Проверка новостей каждые 15 минут
     app.job_queue.run_repeating(
         check_and_post_news,
-        interval=15 * 60,      # 15 минут
-        first=30,              # первая проверка через 30 секунд после старта
+        interval=15 * 60,  # 15 минут
+        first=30,          # первая проверка через 30 секунд
         name="check-news",
     )
 
-    # ✅ один вечерний дайджест в 21:00
+    # Вечерний дайджест в 21:00
     app.job_queue.run_daily(
         send_evening_digest,
         time=time(21, 0, tzinfo=TZ),
         name="evening-digest",
     )
 
-    logger.info("AI News бот запущен. Проверка новостей каждые 15 минут, дайджест в 21:00.")
-    app.run_polling(allowed_updates=[])  # бот сам не реагирует на сообщения, только задачи
+    logger.info(
+        "AI News бот запущен. Проверка новостей каждые 15 минут, "
+        "вечерний дайджест в 21:00."
+    )
+
+    # Бот не реагирует на апдейты пользователей, только сам шлёт новости и дайджест
+    app.run_polling(allowed_updates=[])
 
 
 if __name__ == "__main__":
