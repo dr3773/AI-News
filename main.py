@@ -221,32 +221,38 @@ def build_post_text(item: Dict) -> str:
     """
     Собираем текст для поста в HTML-формате:
     🧠 <жирный заголовок>
+    
     <текст новости>
-    ➜ Источник (кликабельная ссылка)
-    """
-    title = item["title"]
-    summary = item["summary"]
-    url = item["url"]
 
+    🔗 Источник (кликабельная ссылка)
+    """
+    title = item.get("title", "")
+    summary = item.get("summary", "")
+    url = item.get("url", "")
+
+    # Текст без HTML
     body = build_body_text(title, summary)
 
+    # Экранируем для HTML
     safe_title = escape(title)
     safe_body = escape(body)
     safe_url = escape(url, quote=True)
 
-    # ограничим длину, чтобы Телеграм не ругался
+    # Ограничиваем длину, чтобы Телеграм не ругался
     if len(safe_body) > 3500:
         safe_body = safe_body[:3490] + "…"
 
-    parts = [
+    lines = [
         f"🧠 <b>{safe_title}</b>",
         "",
         safe_body,
-        "",
-        f'<a href="{safe_url}">➜ Источник</a>',
     ]
-    return "\n".join(parts)
 
+    if safe_url:
+        lines.append("")
+        lines.append(f'🔗 <a href="{safe_url}">Источник</a>')
+
+    return "\n".join(lines)
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if ADMIN_ID is None:
