@@ -1,171 +1,136 @@
 import os
-import logging
+import asyncio
 from datetime import time
 from zoneinfo import ZoneInfo
-from html import unescape
-from typing import List, Dict, Optional
-import urllib.request
-import xml.etree.ElementTree as ET
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import feedparser
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 
-# ---------- ЛОГИ ----------
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ---------- НАСТРОЙКИ ----------
+# ============ НАСТРОЙКИ ============
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # как строка в переменной окружения
+ADMIN_ID = 797726160  # твой user_id, чтобы бот писал тебе об ошибках
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
-if not CHANNEL_ID_ENV:
+if not CHANNEL_ID:
     raise RuntimeError("Не найден CHANNEL_ID в переменных окружения")
 
-CHANNEL_ID = int(CHANNEL_ID_ENV)
+CHANNEL_ID = int(CHANNEL_ID)
 
-# твой Telegram ID — для личных уведомлений
-OWNER_ID = 797726160
+# Часовой пояс
+TZ = ZoneInfo("Asia/Dushanbe")
 
-# Google News RSS по ИИ (ru + en)
+# RSS-ленты по ИИ
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-# namespace для media:thumbnail / media:content
-NS = {"media": "http://search.yahoo.com/mrss/"}
+# Создаём бота (без Application, только Bot, чтобы не было getUpdates)
+bot = Bot(TOKEN)
 
 
-# ---------- РАБОТА С RSS ----------
+# ============ РАБОТА С НОВОСТЯМИ ============
 
-def _fetch_rss(url: str, limit: Optional[int] = None) -> List[Dict]:
-    """Скачиваем и разбираем один RSS-фид без сторонних библиотек."""
-    logger.info("Загружаю RSS: %s", url)
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            data = resp.read()
-    except Exception as e:
-        logger.warning("Не удалось загрузить RSS %s: %s", url, e)
-        return []
-
-    try:
-        root = ET.fromstring(data)
-    except Exception as e:
-        logger.warning("Не удалось распарсить RSS %s: %s", url, e)
-        return []
-
-    channel_title = (
-        root.findtext("./channel/title")
-        or root.findtext(".//title")
-        or "Новости ИИ"
-    )
-
-    items: List[Dict] = []
-    for item in root.findall(".//item"):
-        title = item.findtext("title")
-        link = item.findtext("link")
-
-        if not title or not link:
-            continue
-
-        title = unescape(title.strip())
-        link = link.strip()
-
-        # Пытаемся достать картинку
-        image: Optional[str] = None
-        media_content = item.find("media:content", NS)
-        if media_content is not None:
-            image = media_content.get("url")
-
-        if not image:
-            media_thumb = item.find("media:thumbnail", NS)
-            if media_thumb is not None:
-                image = media_thumb.get("url")
-
-        items.append(
-            {
-                "title": title,
-                "url": link,
-                "image": image,
-                "source": channel_title,
-            }
-        )
-
-        if limit is not None and len(items) >= limit:
-            break
-
-    return items
-
-
-def fetch_ai_news(limit: int = 3) -> List[Dict]:
-    """Собираем новости по ИИ из нескольких RSS-лент, убираем дубли."""
-    all_items: List[Dict] = []
-
-    for feed in RSS_FEEDS:
-        all_items.extend(_fetch_rss(feed, limit=limit * 2))
-
-    seen_urls = set()
-    result: List[Dict] = []
-    for item in all_items:
-        url = item["url"]
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
-        result.append(item)
-        if len(result) >= limit:
-            break
-
-    return result
-
-
-# ---------- ОТПРАВКА ДАЙДЖЕСТА ----------
-
-async def _do_send_digest(bot, label: str) -> None:
+def extract_image(entry) -> str | None:
     """
-    Общая логика:
-    - пытаемся получить новости
-    - если что-то сломалось или новостей нет — пишем ТОЛЬКО тебе
-    - если всё ок — шлём дайджест в канал
+    Достаём картинку из RSS-записи, если она есть.
+    Для Google News обычно лежит в media_content.
+    """
+    media = getattr(entry, "media_content", None)
+    if media and isinstance(media, list):
+        url = media[0].get("url")
+        if url:
+            return url
+
+    links = getattr(entry, "links", [])
+    for l in links:
+        if l.get("type", "").startswith("image/") and l.get("href"):
+            return l["href"]
+
+    return None
+
+
+def fetch_ai_news(limit: int = 3):
+    """
+    Собираем новости по ИИ из нескольких RSS-лент.
+    Возвращаем список словарей: title, url, image, source.
+    """
+    items: list[dict] = []
+
+    for feed_url in RSS_FEEDS:
+        parsed = feedparser.parse(feed_url)
+        source_title = parsed.feed.get("title", "Новости ИИ")
+
+        for entry in parsed.entries:
+            title = entry.get("title")
+            link = entry.get("link")
+            if not title or not link:
+                continue
+
+            image = extract_image(entry)
+            items.append(
+                {
+                    "title": title,
+                    "url": link,
+                    "image": image,
+                    "source": source_title,
+                }
+            )
+
+    # Удаляем дубли по ссылке, оставляем первые limit штук
+    seen = set()
+    unique_items = []
+    for it in items:
+        if it["url"] in seen:
+            continue
+        seen.add(it["url"])
+        unique_items.append(it)
+        if len(unique_items) >= limit:
+            break
+
+    return unique_items
+
+
+# ============ ОТПРАВКА ДАЙДЖЕСТА ============
+
+async def send_digest(label: str) -> None:
+    """
+    Отправляет один дайджест (утренний / дневной / вечерний / ночной).
+    В канал — новости, при ошибке — сообщение тебе в личку.
     """
     try:
         news = fetch_ai_news(limit=3)
     except Exception as e:
-        logger.exception("Ошибка при получении новостей")
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"⚠️ {label}: не удалось получить новости.\nПричина: {e}",
-        )
+        # Ошибка при парсинге новостей — пишем только тебе
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"❌ Ошибка при получении новостей ({label}): {e}",
+            )
+        except TelegramError:
+            pass
         return
 
     if not news:
+        # Нет новостей — напишем тебе, чтобы ты знал
         await bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"⚠️ {label}: свежих новостей не найдено, дайджест в канал не отправлен.",
+            chat_id=ADMIN_ID,
+            text=f"⚠️ {label}: свежих новостей по ИИ не найдено.",
         )
         return
 
-    # Заголовок в канал
-    try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=f"🤖 {label}\nПодборка свежих новостей об искусственном интеллекте:",
-        )
-    except Exception as e:
-        logger.exception("Ошибка при отправке заголовка в канал")
-        await bot.send_message(
-            chat_id=OWNER_ID,
-            text=f"⚠️ {label}: не удалось отправить заголовок в канал.\nПричина: {e}",
-        )
-        return
+    # Заголовок выпуска в канал
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"🤖 {label}\nПодборка свежих новостей об искусственном интеллекте:",
+    )
 
-    # Каждую новость — отдельным сообщением
+    # Каждую новость отправляем отдельным сообщением
     for i, item in enumerate(news, start=1):
         title = item["title"]
         url = item["url"]
@@ -182,86 +147,71 @@ async def _do_send_digest(bot, label: str) -> None:
 
         try:
             if image:
-                try:
-                    await bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=image,
-                        caption=caption,
-                        reply_markup=keyboard,
-                    )
-                    continue
-                except Exception as e_photo:
-                    logger.warning("Не удалось отправить фото (%s): %s", image, e_photo)
-
-            # Если фото не получилось — отправляем текст
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=caption,
-                reply_markup=keyboard,
-            )
-        except Exception as e:
-            logger.exception("Ошибка при отправке новости в канал")
-            await bot.send_message(
-                chat_id=OWNER_ID,
-                text=(
-                    f"⚠️ {label}: ошибка при отправке новости в канал.\n"
-                    f"Новость: {title}\nПричина: {e}"
-                ),
-            )
+                # Пробуем отправить с фото
+                await bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=image,
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+            else:
+                # Если картинки нет
+                await bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=caption,
+                    reply_markup=keyboard,
+                )
+        except TelegramError as e:
+            # Если не получилось (битая картинка и т.п.) — пишем тебе
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ Ошибка при отправке новости ({label}): {e}",
+                )
+            except TelegramError:
+                pass
 
 
-async def send_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Функция для JobQueue (по расписанию)."""
-    label = context.job.data.get("label", "Дайджест ИИ")
-    await _do_send_digest(context.bot, label)
+# ============ ЗАПУСК ПЛАНИРОВЩИКА ============
 
+async def main() -> None:
+    scheduler = AsyncIOScheduler(timezone=TZ)
 
-# ---------- КОМАНДЫ ----------
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_chat.send_message(
-        "Привет! 👋\n\n"
-        "Я автоматически публикую дайджесты по ИИ в канал.\n"
-        "Можешь использовать /test, чтобы вручную запустить тестовый дайджест."
-    )
-
-
-async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_chat.send_message("Запускаю тестовый дайджест…")
-    await _do_send_digest(context.bot, "Тестовый ИИ-дайджест")
-
-
-# ---------- ЗАПУСК ПРИЛОЖЕНИЯ ----------
-
-def main() -> None:
-    app = Application.builder().token(TOKEN).build()
-
-    # Команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("test", cmd_test))
-
-    # Расписание (по времени Душанбе)
-    tz = ZoneInfo("Asia/Dushanbe")
+    # Расписание: 5 раз в день
     schedule = [
-        ("Утренний дайджест ИИ", time(9, 0, tzinfo=tz)),
-        ("Дневной дайджест ИИ", time(12, 0, tzinfo=tz)),
-        ("Дневной дайджест ИИ", time(15, 0, tzinfo=tz)),
-        ("Вечерний дайджест ИИ", time(18, 0, tzinfo=tz)),
-        ("Ночной дайджест ИИ", time(21, 0, tzinfo=tz)),
+        ("Утренний дайджест ИИ", 9, 0),
+        ("Дневной дайджест ИИ", 12, 0),
+        ("Дневной дайджест ИИ", 15, 0),
+        ("Вечерний дайджест ИИ", 18, 0),
+        ("Ночной дайджест ИИ", 21, 0),
     ]
 
-    for label, t in schedule:
-        app.job_queue.run_daily(
-            send_digest_job,
-            time=t,
-            data={"label": label},
-            name=label,
+    for label, hour, minute in schedule:
+        scheduler.add_job(
+            send_digest,
+            "cron",
+            hour=hour,
+            minute=minute,
+            args=[label],
+            id=label,  # чтобы не дублировались
+            replace_existing=True,
         )
 
-    logging.info("Запускаю бота с расписанием дайджестов…")
-    app.run_polling()
+    scheduler.start()
+
+    # Сообщение только тебе, что бот запущен
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text="🤖 AI News Bot запущен. Расписание дайджестов активировано.",
+        )
+    except TelegramError:
+        pass
+
+    # Держим процесс живым
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
