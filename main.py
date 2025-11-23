@@ -1,11 +1,10 @@
 import os
+import sys
+import types
+import html as _html
 import logging
-import html
-from datetime import time
+from datetime import date, time
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
-from urllib.request import urlopen
-import xml.etree.ElementTree as ET
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -15,330 +14,360 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ================= НАСТРОЙКИ ОКРУЖЕНИЯ =================
+# --------------------------------------------------------------------
+# ЛОГИРОВАНИЕ
+# --------------------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------
+# КОСТЫЛЬ ДЛЯ feedparser НА PYTHON 3.13 (МОДУЛЬ cgi УДАЛЁН)
+# --------------------------------------------------------------------
+# Создаём фейковый модуль cgi, чтобы feedparser не падал.
+cgi_mod = types.ModuleType("cgi")
+
+
+def _cgi_escape(s, quote=True):
+    return _html.escape(s, quote=quote)
+
+
+cgi_mod.escape = _cgi_escape
+sys.modules.setdefault("cgi", cgi_mod)
+
+import feedparser  # noqa: E402  (после вставки cgi)
+
+
+# --------------------------------------------------------------------
+# НАСТРОЙКИ И ОКРУЖЕНИЕ
+# --------------------------------------------------------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
-ADMIN_ID_ENV = os.getenv("ADMIN_ID")  # твой личный Telegram ID (для ошибок)
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+ADMIN_ID = os.getenv("ADMIN_ID")  # id твоего личного аккаунта
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
-
-if not CHANNEL_ID_ENV:
+if not CHANNEL_ID:
     raise RuntimeError("Не найден CHANNEL_ID в переменных окружения")
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID_ENV)
-except ValueError:
-    raise RuntimeError("CHANNEL_ID должен быть целым числом (например -1001234567890)")
+CHANNEL_ID = int(CHANNEL_ID)
 
-ADMIN_ID = None
-if ADMIN_ID_ENV:
+if ADMIN_ID:
     try:
-        ADMIN_ID = int(ADMIN_ID_ENV)
+        ADMIN_ID = int(ADMIN_ID)
     except ValueError:
-        # если неправильно указали, просто не используем
+        logger.warning("ADMIN_ID не является числом, уведомления админу отключены")
         ADMIN_ID = None
+else:
+    ADMIN_ID = None
 
-# ================= ИСТОЧНИКИ НОВОСТЕЙ =================
-# Здесь можно постепенно добавлять свои RSS-ленты про ИИ
-
+# Только русскоязычные/основные источники по ИИ.
+# При желании сюда можно добавлять RSS-ленты конкретных изданий.
 RSS_FEEDS = [
-    # Google News по запросу "искусственный интеллект" (рус)
+    # Google News по запросу «искусственный интеллект»
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
-    # Google News по запросу "artificial intelligence" (англ, но описание часто на англ)
-    "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
+    # Можно дублировать с другими ключами
+    "https://news.google.com/rss/search?q=нейросети+искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-# Чтобы не спамить одинаковыми новостями
-posted_urls = set()
+# --------------------------------------------------------------------
+# ГЛОБАЛЬНОЕ СОСТОЯНИЕ ДЛЯ НОВОСТЕЙ
+# --------------------------------------------------------------------
+seen_links: set[str] = set()       # уже опубликованные ссылки (за всё время работы процесса)
+today_articles: list[dict] = []    # статьи за текущий день (для дайджеста)
+today_date: date = date.today()    # чтобы в полночь чистить список
 
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-
-def fetch_url(url: str, timeout: int = 10) -> bytes:
-    """Загрузить сырые данные по URL."""
-    with urlopen(url, timeout=timeout) as resp:
-        return resp.read()
-
-
-def strip_html(text: str) -> str:
-    """Грубая очистка HTML из описания RSS."""
-    import re
-
+# --------------------------------------------------------------------
+# УТИЛИТЫ
+# --------------------------------------------------------------------
+def clean_html(text: str) -> str:
+    """Удаляем простейшие HTML-теги из summary."""
     if not text:
         return ""
-    # убираем теги
-    clean = re.sub(r"<[^>]+>", " ", text)
-    # декодируем HTML-сущности
-    clean = html.unescape(clean)
-    # сжимаем пробелы
-    clean = " ".join(clean.split())
-    return clean
+    import re
+
+    text = _html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def parse_rss(url: str):
+def extract_image(entry) -> str | None:
+    """Пытаемся вытащить картинку из RSS-записи."""
+    media = getattr(entry, "media_content", None)
+    if media and isinstance(media, list):
+        url = media[0].get("url")
+        if url:
+            return url
+
+    links = getattr(entry, "links", [])
+    for l in links:
+        if l.get("type", "").startswith("image/") and l.get("href"):
+            return l["href"]
+
+    return None
+
+
+def fetch_ai_news(max_per_feed: int = 10) -> list[dict]:
     """
-    Простейший парсер RSS.
-    Возвращает список словарей: title, url, summary, image.
+    Забираем новости по ИИ из всех RSS_FEEDS.
+    Возвращаем список словарей: {title, url, summary, image, source}.
     """
-    items = []
-    try:
-        raw = fetch_url(url)
-    except Exception as e:
-        logging.exception("Ошибка загрузки RSS %s: %s", url, e)
-        return items
+    items: list[dict] = []
 
-    try:
-        root = ET.fromstring(raw)
-    except Exception as e:
-        logging.exception("Ошибка разбора XML %s: %s", url, e)
-        return items
-
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        description = (item.findtext("description") or "").strip()
-
-        if not title or not link:
+    for feed_url in RSS_FEEDS:
+        try:
+            parsed = feedparser.parse(feed_url)
+        except Exception as e:  # защитимся от падения одной ленты
+            logger.warning("Ошибка парсинга RSS %s: %r", feed_url, e)
             continue
 
-        summary = strip_html(description)
+        source_title = parsed.feed.get("title", "Новости ИИ")
 
-        # Картинка, если есть <enclosure type="image/*" url="...">
-        image_url = None
-        enclosure = item.find("enclosure")
-        if enclosure is not None and enclosure.get("type", "").startswith("image"):
-            image_url = enclosure.get("url")
+        for entry in parsed.entries[:max_per_feed]:
+            title = entry.get("title")
+            link = entry.get("link")
+            if not title or not link:
+                continue
 
-        items.append(
-            {
-                "title": title,
-                "url": link,
-                "summary": summary,
-                "image": image_url,
-            }
-        )
+            summary_raw = entry.get("summary") or entry.get("description") or ""
+            summary = clean_html(summary_raw)
 
+            # если summary слишком короткий и копирует заголовок — всё равно оставим
+            image = extract_image(entry)
+
+            items.append(
+                {
+                    "title": title.strip(),
+                    "url": link.strip(),
+                    "summary": summary,
+                    "image": image,
+                    "source": source_title,
+                }
+            )
+
+    # можно было бы сортировать по дате, но для начала можно и так
     return items
 
 
-def fetch_ai_news(max_items: int = 5):
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Отправка служебного сообщения админу (только в личку)."""
+    if not ADMIN_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text}")
+    except Exception as e:
+        logger.warning("Не удалось отправить сообщение админу: %r", e)
+
+
+def reset_today_if_needed() -> None:
+    """Если наступил новый день — очищаем список today_articles."""
+    global today_date, today_articles
+    now = date.today()
+    if now != today_date:
+        today_date = now
+        today_articles = []
+
+
+# --------------------------------------------------------------------
+# ОТПРАВКА ОДНОЙ НОВОСТИ В КАНАЛ
+# --------------------------------------------------------------------
+async def send_article(context: ContextTypes.DEFAULT_TYPE, item: dict) -> None:
     """
-    Собираем новости из всех RSS-лент,
-    убираем дубли по URL и возвращаем первые max_items штук.
+    Формат поста:
+    🧠 Заголовок
+
+    Нормальный текст (пересказ из summary / description).
+
+    ➡️ Источник   (слово «Источник» — кликабельная ссылка, домен не виден)
     """
-    all_items = []
+    from telegram import Bot
 
-    for feed in RSS_FEEDS:
-        parsed = parse_rss(feed)
-        for item in parsed:
-            # убираем уже отправленные
-            if item["url"] in posted_urls:
-                continue
-            all_items.append(item)
+    bot: Bot = context.bot
 
-    unique = []
-    seen = set()
-    for it in all_items:
-        url = it["url"]
-        if url in seen:
-            continue
-        seen.add(url)
-        unique.append(it)
-        if len(unique) >= max_items:
-            break
+    title = item["title"]
+    url = item["url"]
+    summary = item["summary"]
+    image = item["image"]
 
-    return unique
+    # Если summary пустой — хотя бы один раз используем заголовок
+    if not summary:
+        summary = title
 
+    # делаем текст чуть длиннее — summary часто уже нормальный абзац
+    text_parts = [
+        f"🧠 <b>{_html.escape(title)}</b>",
+        "",
+        _html.escape(summary),
+        "",
+        f'➡️ <a href="{_html.escape(url)}">Источник</a>',
+    ]
+    text = "\n".join(text_parts)
 
-def build_source_line(url: str) -> str:
-    """
-    Строка вида:
-    ➡️ Источник: <a href="...">rbc.ru</a>
-    Никаких «Подробнее», «Google Новости» и т.п.
-    """
-    parsed = urlparse(url)
-    host = parsed.netloc or "источник"
-    if host.startswith("www."):
-        host = host[4:]
-
-    safe_url = html.escape(url, quote=True)
-    safe_host = html.escape(host)
-
-    return f'➡️ Источник: <a href="{safe_url}">{safe_host}</a>'
-
-
-async def send_single_news(
-    context: ContextTypes.DEFAULT_TYPE,
-    item: dict,
-    prefix_emoji: str = "🧠",
-) -> None:
-    """
-    Отправка одной новости в канал:
-    - жирный заголовок
-    - короткое описание
-    - в конце только строка с источником
-    """
-    title = html.escape(item["title"])
-
-    summary = item.get("summary") or ""
-    # режем описание, чтобы не было простыней
-    if len(summary) > 700:
-        summary = summary[:700].rsplit(" ", 1)[0] + "…"
-    summary = html.escape(summary)
-
-    source_line = build_source_line(item["url"])
-
-    text = f"{prefix_emoji} <b>{title}</b>\n\n{summary}\n\n{source_line}"
-
-    # Пытаемся отправить с фото
-    image_url = item.get("image")
-    if image_url:
-        try:
-            await context.bot.send_photo(
+    try:
+        if image:
+            # Вариант 3: картинка + заголовок/текст под ней
+            await bot.send_photo(
                 chat_id=CHANNEL_ID,
-                photo=image_url,
+                photo=image,
                 caption=text,
                 parse_mode=ParseMode.HTML,
             )
-            return
-        except Exception as e:
-            logging.exception("Не удалось отправить фото: %s. Падаем в текст.", e)
+        else:
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logger.exception("Ошибка при отправке статьи: %r", e)
+        await notify_admin(context, f"Ошибка при отправке новости: {e!r}")
 
-    # Текстовый вариант
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=text,
-        parse_mode=ParseMode.HTML,
-    )
 
-
-# ================= JOB'Ы =================
-
-async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+# --------------------------------------------------------------------
+# ПЕРИОДИЧЕСКАЯ ПРОВЕРКА НОВОСТЕЙ
+# --------------------------------------------------------------------
+async def poll_and_post_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Периодический постинг свежих новостей в течение дня.
-    Проверяем RSS, берём несколько новых, отправляем.
+    Регулярно (например, каждые 20–30 минут) берём новости из RSS,
+    отбрасываем уже опубликованные ссылки и постим только новые.
     """
-    news = fetch_ai_news(max_items=3)
-    if not news:
-        logging.info("Свежих новостей сейчас нет.")
-        return
-
-    for item in news:
-        url = item["url"]
-        posted_urls.add(url)
-        await send_single_news(context, item, prefix_emoji="🤖")
-
-
-async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Вечерний дайджест в 21:00 — краткий список с заголовками и ссылками.
-    """
-    news = fetch_ai_news(max_items=5)
-    if not news:
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text="Сегодня не нашлось достойных новостей по ИИ.",
-        )
-        return
-
-    lines = ["🤖 Вечерний дайджест ИИ", ""]
-    for i, item in enumerate(news, start=1):
-        title = html.escape(item["title"])
-        source_line = build_source_line(item["url"])
-        lines.append(f"{i}. {title}")
-        lines.append(source_line)
-        lines.append("")
-
-        posted_urls.add(item["url"])
-
-    text = "\n".join(lines).strip()
-
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=text,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ================= ОБРАБОТЧИКИ КОМАНД =================
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🤖 AI News Bot запущен.\n"
-        "Буду публиковать свежие новости об ИИ в канал и делать вечерний дайджест в 21:00."
-    )
-
-
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /test — отправить одну тестовую новость в канал.
-    Удобно для проверки, что всё работает.
-    """
-    news = fetch_ai_news(max_items=1)
-    if not news:
-        await update.message.reply_text("Свежих новостей пока не нашлось.")
-        return
-
-    item = news[0]
-    posted_urls.add(item["url"])
-    await send_single_news(context, item, prefix_emoji="🧪")
-    await update.message.reply_text("Тестовая новость отправлена в канал.")
-
-
-# ================= ОБРАБОТЧИК ОШИБОК =================
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logging.exception("Ошибка в обработчике: %s", context.error)
-
-    if ADMIN_ID is None:
-        return
+    reset_today_if_needed()
+    global seen_links, today_articles
 
     try:
-        text = f"⚠️ Ошибка в боте: {repr(context.error)}"
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-    except Exception:
-        logging.exception("Не удалось отправить сообщение администратору.")
+        all_items = fetch_ai_news(max_per_feed=10)
+    except Exception as e:
+        logger.exception("Ошибка fetch_ai_news: %r", e)
+        await notify_admin(context, f"Ошибка при загрузке новостей: {e!r}")
+        return
+
+    new_items: list[dict] = []
+    for item in all_items:
+        link = item["url"]
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        new_items.append(item)
+
+    if not new_items:
+        return
+
+    # чтобы не заспамить — ограничим пачку, например, 3–4 новостями за цикл
+    for item in new_items[:4]:
+        await send_article(context, item)
+        today_articles.append(item)
 
 
-# ================= ЗАПУСК ПРИЛОЖЕНИЯ =================
+# --------------------------------------------------------------------
+# ВЕЧЕРНИЙ ДАЙДЖЕСТ (21:00)
+# --------------------------------------------------------------------
+async def send_evening_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Один вечерний дайджест за день: список главных новостей."""
+    reset_today_if_needed()
 
+    if not today_articles:
+        # ничего не было — ничего не шлём в канал
+        return
+
+    # Возьмём последние 5 новостей дня
+    last_items = today_articles[-5:]
+
+    lines = ["📊 <b>Вечерний дайджест ИИ</b>", "", "Главные новости сегодня:"]
+    for i, item in enumerate(last_items, start=1):
+        lines.append(f"{i}. {_html.escape(item['title'])}")
+
+    lines.append("")
+    lines.append("Подробнее — в постах выше за сегодня 👆")
+
+    text = "\n".join(lines)
+
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.exception("Ошибка отправки дайджеста: %r", e)
+        await notify_admin(context, f"Ошибка при отправке дайджеста: {e!r}")
+
+
+# --------------------------------------------------------------------
+# ОБРАБОТЧИКИ КОМАНД
+# --------------------------------------------------------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запуск бота в личке /start."""
+    msg = (
+        "🤖 AI News Bot запущен.\n\n"
+        "▫️ Днём он публикует важные новости об искусственном интеллекте по мере появления в источниках.\n"
+        "▫️ В 21:00 по Душанбе выходит вечерний дайджест с главными заголовками за день.\n\n"
+        "Если будут ошибки — я пришлю тебе уведомление отдельно."
+    )
+    await update.message.reply_text(msg)
+
+
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ручной тест: взять одну свежую новость и отправить в канал."""
+    await update.message.reply_text("Ок! Публикую тестовую новость в канал.")
+
+    try:
+        items = fetch_ai_news(max_per_feed=3)
+    except Exception as e:
+        logger.exception("Ошибка fetch_ai_news в /test: %r", e)
+        await update.message.reply_text(f"Ошибка загрузки новостей: {e!r}")
+        return
+
+    if not items:
+        await update.message.reply_text("Свежих новостей сейчас не нашлось.")
+        return
+
+    # Берём первую
+    item = items[0]
+    # Помечаем как увиденную, чтобы потом не дублировать
+    seen_links.add(item["url"])
+    today_articles.append(item)
+
+    await send_article(context, item)
+
+
+# --------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .parse_mode(ParseMode.HTML)  # по умолчанию HTML-разметка
+        .build()
     )
 
-    app = Application.builder().token(TOKEN).build()
-
     # Команды
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("test", test_cmd))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("test", test_command))
 
-    # Ошибки
-    app.add_error_handler(error_handler)
-
-    # Планировщик
+    # Часовой пояс Душанбе
     tz = ZoneInfo("Asia/Dushanbe")
 
-    # Автоновости в течение дня — каждые 60 минут
+    # Периодическая проверка новостей (каждые 30 минут)
     app.job_queue.run_repeating(
-        auto_news_job,
-        interval=60 * 60,   # 1 час
-        first=30,           # первая проверка через 30 секунд после старта
-        name="auto_news",
+        poll_and_post_news,
+        interval=30 * 60,
+        first=30,  # через 30 секунд после запуска
+        name="poll_news",
     )
 
     # Вечерний дайджест в 21:00
     app.job_queue.run_daily(
-        daily_digest_job,
+        send_evening_digest,
         time=time(21, 0, tzinfo=tz),
-        name="daily_digest",
+        name="evening_digest",
     )
 
-    # Запускаем long polling
+    logger.info("AI News Bot запускается (run_polling)...")
     app.run_polling(allowed_updates=["message"])
 
 
