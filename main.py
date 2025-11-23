@@ -26,19 +26,16 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 if not CHANNEL_ID:
     raise RuntimeError("Не задан CHANNEL_ID — id или @username канала.")
 
-# id твоего личного чата для уведомлений об ошибках (можно оставить пустым)
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip() or None
 
-# интервал проверки новостей (в секундах)
-NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # по умолчанию каждые 30 минут
+# интервал проверки новостей (секунды)
+NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут по умолчанию
 
-# часовой пояс (по умолчанию Душанбе)
+# часовой пояс (Душанбе)
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Dushanbe"))
 
-# файл, где храним уже отправленные ссылки
 SENT_URLS_FILE = "sent_urls.json"
 
-# RSS-источники
 FEEDS: List[str] = [
     "https://nplus1.ru/rss",
     "https://habr.com/ru/rss/hub/machine_learning/all/",
@@ -47,10 +44,7 @@ FEEDS: List[str] = [
     "https://openai.com/blog/rss.xml",
 ]
 
-# буфер новостей за день для вечернего дайджеста
 TODAY_NEWS: List[Dict] = []
-
-# множество уже отправленных урлов
 SENT_URLS: Set[str] = set()
 
 # ------------------- ЛОГИ -------------------
@@ -61,11 +55,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai-news-bot")
 
-
 # ------------------- ХЕЛПЕРЫ -------------------
 
+
 def clean_html(text: str) -> str:
-    """Убираем теги HTML и лишние пробелы."""
+    """Убираем HTML-теги и лишние пробелы."""
     if not text:
         return ""
     text = unescape(text)
@@ -104,19 +98,17 @@ def save_sent_urls() -> None:
 
 
 def parse_entry(feed_title: str, entry) -> Dict:
-    """Преобразуем запись RSS в стандартный словарь."""
+    """Превращаем запись RSS в словарь."""
     title = entry.get("title", "").strip()
     summary = entry.get("summary", "") or entry.get("description", "")
     link = entry.get("link", "")
 
-    # дата
     published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
     if published_parsed:
         dt = datetime.fromtimestamp(mktime(published_parsed), tz=TZ)
     else:
         dt = datetime.now(TZ)
 
-    # попытка найти картинку
     image_url = ""
     content = ""
     if "content" in entry and entry.content:
@@ -139,7 +131,7 @@ def parse_entry(feed_title: str, entry) -> Dict:
 
 
 def fetch_news() -> List[Dict]:
-    """Получаем новые новости с RSS-лент."""
+    """Читаем все RSS-ленты и собираем новые новости."""
     items: List[Dict] = []
 
     for feed_url in FEEDS:
@@ -156,6 +148,7 @@ def fetch_news() -> List[Dict]:
         except Exception as e:
             logger.exception("Ошибка при чтении %s: %s", feed_url, e)
 
+    # новые сверху
     items.sort(key=lambda x: x["date"], reverse=True)
     return items
 
@@ -165,20 +158,17 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if not ADMIN_CHAT_ID:
         return
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"⚠️ {text}",
-        )
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ {text}")
     except Exception:
         logger.exception("Не удалось отправить сообщение админу.")
 
 
 def build_body_text(title: str, summary: str) -> str:
     """
-    Делаем нормальный текст новости:
-    - убираем HTML-теги;
-    - если summary есть и не дублирует заголовок — используем его;
-    - если нет нормального summary — возвращаем пустую строку.
+    Короткий нормальный текст новости:
+    - чистим теги;
+    - если есть внятный summary (не дублирует заголовок) — используем его;
+    - иначе возвращаем пустую строку.
     """
     title_clean = clean_html(title)
     summary_clean = clean_html(summary)
@@ -191,7 +181,7 @@ def build_body_text(title: str, summary: str) -> str:
 
 def build_post_text(item: Dict) -> str:
     """
-    Формат поста:
+    Итоговый формат поста:
     🧠 <жирный заголовок>
 
     <краткое описание, если есть>
@@ -226,6 +216,7 @@ def build_post_text(item: Dict) -> str:
 
 
 # ------------------- JOBS -------------------
+
 
 async def periodic_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Периодическая проверка новостей и отправка новых в канал."""
@@ -313,6 +304,7 @@ async def daily_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ------------------- HANDLERS -------------------
 
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /start в личке с ботом."""
     if update.effective_chat is None:
@@ -322,12 +314,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "👋 Привет! Я бот канала с новостями об искусственном интеллекте.\n\n"
         "Что я делаю:\n"
         "• в течение дня публикую свежие новости об ИИ из разных источников;\n"
-        "• аккуратно оформляю заголовок и краткое описание;\n"
+        "• аккуратно оформляю заголовок и короткое описание;\n"
         "• в 21:00 по Душанбе отправляю вечерний дайджест за день."
     )
 
 
 # ------------------- MAIN -------------------
+
 
 def main() -> None:
     logger.info("Запуск ai-news-bot")
@@ -349,7 +342,7 @@ def main() -> None:
     job_queue.run_repeating(
         periodic_news_job,
         interval=NEWS_INTERVAL,
-        first=30,
+        first=30,  # через 30 секунд после старта
         name="periodic_news",
     )
 
@@ -360,7 +353,7 @@ def main() -> None:
         name="daily_digest",
     )
 
-    # ВАЖНО: никаких asyncio.run, никаких своих event loop
+    # ВАЖНО: без asyncio.run, без своих event loop
     app.run_polling(allowed_updates=["message"])
 
 
