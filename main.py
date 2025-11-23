@@ -1,66 +1,36 @@
 import os
-import logging
-import random
 from datetime import time
 from zoneinfo import ZoneInfo
-from html import escape as html_escape
 
 import feedparser
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, ContextTypes
 
-# ===== ЛОГИРОВАНИЕ =====
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ===== НАСТРОЙКИ И ТОКЕНЫ =====
+# ====== НАСТРОЙКИ ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID")
-ADMIN_ID_ENV = os.getenv("ADMIN_ID")  # твой ID, чтобы слать ошибки (можно не задавать)
+CHANNEL_ID = os.getenv("CHANNEL_ID")      # ID канала
+ADMIN_ID = os.getenv("ADMIN_ID")          # ID администратора (строка)
 
 if not TOKEN:
     raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN в переменных окружения")
-if not CHANNEL_ID_ENV:
+if not CHANNEL_ID:
     raise RuntimeError("Не найден CHANNEL_ID в переменных окружения")
+if not ADMIN_ID:
+    raise RuntimeError("Не найден ADMIN_ID в переменных окружения")
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID_ENV)
-except ValueError:
-    raise RuntimeError("CHANNEL_ID должен быть числом (например -1003238891648)")
+CHANNEL_ID = int(CHANNEL_ID)
+ADMIN_ID = int(ADMIN_ID)
 
-ADMIN_ID: int | None = None
-if ADMIN_ID_ENV:
-    try:
-        ADMIN_ID = int(ADMIN_ID_ENV)
-    except ValueError:
-        logger.warning("ADMIN_ID задан некорректно, уведомления админу отключены")
-
-
-# ===== ИСТОЧНИКИ НОВОСТЕЙ (РАСШИРЕННЫЙ НАБОР) =====
+# RSS-ленты по ИИ
 RSS_FEEDS = [
-    # Русский ИИ
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
-    "https://news.google.com/rss/search?q=нейросети&hl=ru&gl=RU&ceid=RU:ru",
-    "https://news.google.com/rss/search?q=машинное+обучение&hl=ru&gl=RU&ceid=RU:ru",
-
-    # Английский ИИ
-    "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=machine+learning&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=\"generative+ai\"+OR+genai&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=artificial+intelligence&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
 
 def extract_image(entry) -> str | None:
     """
     Достаём картинку из RSS-записи, если она есть.
-    Для Google News иногда лежит в media_content или ссылках с type=image/*.
+    Для Google News обычно лежит в media_content или среди links.
     """
     media = getattr(entry, "media_content", None)
     if media and isinstance(media, list):
@@ -69,14 +39,14 @@ def extract_image(entry) -> str | None:
             return url
 
     links = getattr(entry, "links", [])
-    for link in links:
-        if link.get("type", "").startswith("image/") and link.get("href"):
-            return link["href"]
+    for l in links:
+        if l.get("type", "").startswith("image/") and l.get("href"):
+            return l["href"]
 
     return None
 
 
-def fetch_ai_news(limit: int = 3) -> list[dict]:
+def fetch_ai_news(limit: int = 3):
     """
     Собираем новости по ИИ из нескольких RSS-лент.
     Возвращаем список словарей: title, url, image, source.
@@ -84,12 +54,7 @@ def fetch_ai_news(limit: int = 3) -> list[dict]:
     items: list[dict] = []
 
     for feed_url in RSS_FEEDS:
-        try:
-            parsed = feedparser.parse(feed_url)
-        except Exception as e:
-            logger.warning("Не удалось прочитать RSS %s: %s", feed_url, e)
-            continue
-
+        parsed = feedparser.parse(feed_url)
         source_title = parsed.feed.get("title", "Новости ИИ")
 
         for entry in parsed.entries:
@@ -99,7 +64,6 @@ def fetch_ai_news(limit: int = 3) -> list[dict]:
                 continue
 
             image = extract_image(entry)
-
             items.append(
                 {
                     "title": title,
@@ -109,15 +73,9 @@ def fetch_ai_news(limit: int = 3) -> list[dict]:
                 }
             )
 
-    if not items:
-        return []
-
-    # Перемешиваем, чтобы каждый дайджест был чуть разный
-    random.shuffle(items)
-
-    # Удаляем дубли по ссылке и ограничиваем количеством
+    # Удаляем дубли по ссылке, оставляем первые limit штук
     seen = set()
-    unique_items: list[dict] = []
+    unique_items = []
     for it in items:
         if it["url"] in seen:
             continue
@@ -129,40 +87,28 @@ def fetch_ai_news(limit: int = 3) -> list[dict]:
     return unique_items
 
 
-async def post_digest(label: str, application: Application) -> None:
+async def send_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Общая функция отправки дайджеста в канал.
-    label — заголовок (утренний/дневной/вечерний и т.п.).
+    Универсальный отправщик дайджеста.
+    Название (утренний/дневной/вечерний) берём из context.job.data["label"].
     """
-    try:
-        news = fetch_ai_news(limit=3)
-    except Exception as e:
-        logger.exception("Ошибка при получении новостей")
-        if ADMIN_ID:
-            try:
-                await application.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"⚠️ {label}: ошибка при получении новостей: {e}",
-                )
-            except Exception:
-                pass
-        return
+    label: str = context.job.data.get("label", "Дайджест ИИ")
+
+    news = fetch_ai_news(limit=3)
 
     if not news:
-        text = (
-            f"⚠️ {label}\n"
-            f"Сегодня свежих новостей по ИИ не нашлось. "
-            f"Попробуем снова в следующем выпуске."
+        # Пишем только админу, если новостей нет
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ {label}: не удалось найти свежие новости по ИИ.",
         )
-        await application.bot.send_message(chat_id=CHANNEL_ID, text=text)
         return
 
-    # Заголовок выпуска
-    header = (
-        f"🤖 {label}\n"
-        f"Подборка свежих новостей об искусственном интеллекте:"
+    # Заголовок выпуска в канал
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"🤖 {label}\nПодборка свежих новостей об искусственном интеллекте:",
     )
-    await application.bot.send_message(chat_id=CHANNEL_ID, text=header)
 
     # Каждую новость отправляем отдельным сообщением
     for i, item in enumerate(news, start=1):
@@ -171,107 +117,43 @@ async def post_digest(label: str, application: Application) -> None:
         image = item["image"]
         source = item["source"]
 
-        safe_url = html_escape(url, quote=True)
-        safe_source = html_escape(source, quote=True)
-
-        # Источник — кликабельная ссылка, без текста "читать полностью"
+        # Источник сам является кликабельной ссылкой
         caption = (
             f"{i}. {title}\n"
-            f'📎 Источник: <a href="{safe_url}">{safe_source}</a>'
+            f"📎 Источник: <a href=\"{url}\">{source}</a>"
         )
 
-        # Ограничение на длину подписи
+        # Ограничение Telegram на длину подписи
         if len(caption) > 1024:
             caption = caption[:1020] + "…"
 
-        try:
-            if image:
-                try:
-                    await application.bot.send_photo(
-                        chat_id=CHANNEL_ID,
-                        photo=image,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-                    continue
-                except Exception as e_photo:
-                    logger.warning("Не удалось отправить фото (%s): %s", image, e_photo)
+        if image:
+            # Пытаемся отправить с фото
+            try:
+                await context.bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=image,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+                continue
+            except Exception:
+                # Если с фото проблема — отправляем как текст
+                pass
 
-            await application.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=caption,
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.exception("Ошибка при отправке новости в канал")
-            if ADMIN_ID:
-                try:
-                    await application.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            f"⚠️ {label}: ошибка при отправке новости.\n"
-                            f"Новость: {title}\nПричина: {e}"
-                        ),
-                    )
-                except Exception:
-                    pass
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=caption,
+            parse_mode="HTML",
+        )
 
 
-# ====== JOB-ФУНКЦИЯ ДЛЯ ПЛАНИРОВЩИКА ======
-async def send_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обёртка для job_queue: достаём label из context.job.data и шлём дайджест."""
-    label: str = context.job.data.get("label", "Дайджест ИИ")
-    await post_digest(label, context.application)
-
-
-# ===== ХЕНДЛЕРЫ КОМАНД БОТА =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start в личке с ботом:
-    - отвечает текстом,
-    - отправляет тестовый дайджест в канал.
-    """
-    chat_id = update.effective_chat.id
-
-    await update.message.reply_text(
-        "🤖 Привет! Я AI News Bot.\n\n"
-        "Каждый день я делаю несколько дайджестов новостей об искусственном интеллекте "
-        "и публикую их в канале.\n\n"
-        "Сейчас отправлю тестовый дайджест в канал, чтобы всё проверить."
-    )
-
-    await post_digest("Тестовый автодайджест ИИ", context.application)
-
-    if ADMIN_ID and chat_id != ADMIN_ID:
-        logger.info("Команду /start использовал пользователь %s", chat_id)
-
-
-# ===== ОБРАБОТЧИК ОШИБОК =====
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Ошибка при обработке апдейта:", exc_info=context.error)
-
-    if ADMIN_ID:
-        try:
-            msg = f"⚠️ AI News Bot: ошибка: {context.error}"
-            await context.application.bot.send_message(chat_id=ADMIN_ID, text=msg)
-        except Exception as e:
-            logger.error("Не удалось отправить ошибку админу: %s", e)
-
-
-# ===== ОСНОВНАЯ ФУНКЦИЯ =====
 async def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
-    # Команды
-    app.add_handler(CommandHandler("start", start))
-
-    # Обработчик ошибок
-    app.add_error_handler(error_handler)
-
-    # Часовой пояс Душанбе
     tz = ZoneInfo("Asia/Dushanbe")
 
-    # Расписание дайджестов
+    # 5 выпусков в день
     schedule = [
         ("Утренний дайджест ИИ", time(9, 0, tzinfo=tz)),
         ("Дневной дайджест ИИ", time(12, 0, tzinfo=tz)),
@@ -282,18 +164,16 @@ async def main() -> None:
 
     for label, t in schedule:
         app.job_queue.run_daily(
-            send_digest_job,
+            send_digest,
             time=t,
             data={"label": label},
             name=label,
         )
 
-    logging.info("Запускаю бота с расписанием дайджестов…")
-
-    # Разрешаем только сообщения (для /start), остальное не нужно
-    await app.run_polling(allowed_updates=["message"])
+    await app.run_polling(allowed_updates=[])
 
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())
