@@ -328,7 +328,7 @@ async def main() -> None:
     # хук, который вызовется сразу после инициализации и запустит background_worker
     application.post_init = on_startup
 
-    await application.run_polling()
+    await application.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
