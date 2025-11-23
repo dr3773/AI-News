@@ -331,6 +331,6 @@ async def main() -> None:
     await application.run_polling(close_loop=False)
 
 
-if name == "__main__":
+if __name__ == "__main__":
     import asyncio
     asyncio.get_event_loop().run_until_complete(main())
