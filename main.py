@@ -20,7 +20,7 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN")
 if not TOKEN:
-    raise RuntimeError("Не задан токен бота. Укажи BOT_TOKEN или TOKEN в переменных окружения.")
+    raise RuntimeError("8556091896:AAEXJ8QEHiA6-QcFZG1YmHMf1H3B00WVM4g")
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 if not CHANNEL_ID:
