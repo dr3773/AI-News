@@ -2,6 +2,9 @@ import os
 import logging
 import re
 from html import unescape, escape
+from time import mktime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Set
 
 import feedparser
@@ -17,44 +20,39 @@ from telegram.ext import (
 #        НАСТРОЙКИ
 # ==========================
 
-# Токен бота и ID канала берем из переменных окружения Render
+# Берём токен из TELEGRAM_BOT_TOKEN (как у тебя в Render),
+# а BOT_TOKEN / TOKEN — как запасные варианты.
 TOKEN = (
     os.environ.get("TELEGRAM_BOT_TOKEN")
     or os.environ.get("BOT_TOKEN")
     or os.environ.get("TOKEN")
 )
 
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # у тебя: -1003238891648
-ADMIN_ID = os.environ.get("ADMIN_ID")      # можно оставить пустым
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
 if not TOKEN:
-    raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN (или BOT_TOKEN / TOKEN) в переменных окружения!")
+    raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN / BOT_TOKEN / TOKEN!")
 
 if not CHANNEL_ID:
-    raise RuntimeError("❌ Не задан CHANNEL_ID в переменных окружения!")
+    raise RuntimeError("❌ Не найден CHANNEL_ID!")
+
+# Часовой пояс (если понадобится по времени)
+TZ = ZoneInfo("Asia/Dushanbe")
 
 # Интервал проверки новостей (секунды)
-NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # по умолчанию 30 минут
+NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут
 
-# RSS-источники новостей по ИИ (Яндекс удалён)
-FEED_URLS: List[str] = [
-    # Google News по запросу "искусственный интеллект" (RU)
-    "https://news.google.com/rss/search?q=%D0%B8%D1%81%D0%BA%D1%83%D1%81%D1%81%D1%82%D0%B2%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9+%D0%B8%D0%BD%D1%82%D0%B5%D0%BB%D0%BB%D0%B5%D0%BA%D1%82&hl=ru&gl=RU&ceid=RU:ru",
+# 🔹 МАКСИМУМ 5 НОВОСТЕЙ ЗА ОДИН ЦИКЛ
+MAX_POSTS_PER_RUN = 5
 
-    # Habr — Machine Learning
-    "https://habr.com/ru/rss/hub/machine_learning/all/",
-
-    # Habr — Искусственный интеллект
-    "https://habr.com/ru/rss/hub/artificial_intelligence/all/",
-
-    # Блог Google AI
-    "https://ai.googleblog.com/feeds/posts/default?alt=rss",
-
-    # Блог OpenAI
-    "https://openai.com/blog/rss.xml",
+# RSS-источники
+FEED_URLS = [
+    "https://news.yandex.ru/computers.rss",
+    "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-# файл, где храним уже отправленные ссылки (чтобы не было дублей после рестарта)
+# файл сохранения отправленных ссылок
 SENT_URLS_FILE = "sent_urls.json"
 sent_urls: Set[str] = set()
 
@@ -68,13 +66,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai-news-bot")
 
-
 # ==========================
 #     ВСПОМОГАТЕЛЬНЫЕ
 # ==========================
 
+
 def clean_html(text: str) -> str:
-    """Убираем HTML-теги (<a>, <font> и т.п.) и лишние пробелы."""
+    """Убираем HTML-теги и лишние пробелы."""
     if not text:
         return ""
     text = unescape(text)
@@ -101,16 +99,16 @@ def load_sent_urls() -> None:
 
 
 def save_sent_urls() -> None:
-    """Сохранить отправленные ссылки в файл."""
+    """Сохранить отправленные ссылки."""
     import json
     try:
         with open(SENT_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(sent_urls), f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.exception("Не удалось сохранить %s: %s", SENT_URLS_FILE, e)
+        logger.exception("Ошибка сохранения ссылок: %s", e)
 
 
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str):
     """Отправить сообщение админу, если указан ADMIN_ID."""
     if not ADMIN_ID:
         return
@@ -124,56 +122,52 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 #      ПАРСИНГ НОВОСТЕЙ
 # ==========================
 
+
 def fetch_news() -> List[Dict]:
-    """
-    Читаем все RSS-ленты и собираем новости.
-    Для Google News в summary идёт <description> с HTML — мы его чистим.
-    """
+    """Читаем RSS-ленты и собираем новости, которых ещё не отправляли."""
     items: List[Dict] = []
 
     for feed_url in FEED_URLS:
         try:
             feed = feedparser.parse(feed_url)
-
             for entry in feed.entries:
                 link = entry.get("link")
                 if not link or link in sent_urls:
                     continue
 
-                raw_title = entry.get("title", "") or ""
-                raw_summary = entry.get("summary", "") or entry.get("description", "") or ""
-
-                title = clean_html(raw_title)
-                summary = clean_html(raw_summary)
+                title = entry.get("title", "").strip()
+                summary = entry.get("summary", "") or entry.get("description", "")
 
                 items.append(
                     {
-                        "title": title,
-                        "summary": summary,
+                        "title": clean_html(title),
+                        "summary": clean_html(summary),
                         "url": link,
                     }
                 )
         except Exception as e:
-            logger.exception("Ошибка при чтении %s: %s", feed_url, e)
+            logger.exception("Ошибка RSS %s: %s", feed_url, e)
 
     return items
 
 
-def build_news_text(title: str, summary: str) -> str:
+def build_body_text(title: str, summary: str) -> str:
     """
-    Формируем текст новости:
-    - если есть summary, который не совпадает полностью с заголовком, используем его;
-    - если summary нет или он идентичен заголовку — оставляем только заголовок.
-    Так мы как раз берём описание из Google <description>, где есть
-    'Заголовок  Источник'.
+    Формируем текст описания новости.
+    ВАЖНО: если нормального описания нет — возвращаем ПУСТУЮ строку.
+    То есть заголовок в тексте не дублируем.
     """
-    title_clean = title.strip()
-    summary_clean = summary.strip()
+    title_clean = clean_html(title)
+    summary_clean = clean_html(summary)
 
-    if summary_clean and summary_clean.lower() != title_clean.lower():
-        return summary_clean
+    # Если summary пустое или начинается с заголовка — считаем его бесполезным
+    if not summary_clean:
+        return ""
 
-    return title_clean
+    if summary_clean.lower().startswith(title_clean.lower()):
+        return ""
+
+    return summary_clean
 
 
 def build_post_text(item: Dict) -> str:
@@ -182,26 +176,19 @@ def build_post_text(item: Dict) -> str:
     summary = item["summary"]
     url = item["url"]
 
-    body_text = build_news_text(title, summary)
+    body = build_body_text(title, summary)
 
     safe_title = escape(title)
-    safe_body = escape(body_text)
     safe_url = escape(url, quote=True)
 
-    if len(safe_body) > 3500:
-        safe_body = safe_body[:3490] + "…"
+    lines = [f"🧠 <b>{safe_title}</b>"]
 
-    lines: List[str] = []
-
-    # Заголовок
-    lines.append(f"🧠 <b>{safe_title}</b>")
-
-    # Описание (если оно не пустое)
-    if safe_body and safe_body.lower() != safe_title.lower():
+    # Добавляем описание только если оно есть и НЕ дублирует заголовок
+    if body:
+        safe_body = escape(body)
         lines.append("")
         lines.append(safe_body)
 
-    # Ссылка
     lines.append("")
     lines.append(f'🔗 <a href="{safe_url}">Источник</a>')
 
@@ -212,28 +199,35 @@ def build_post_text(item: Dict) -> str:
 #      JOB: НОВОСТИ
 # ==========================
 
-async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Периодически проверяем новости и отправляем новые в канал."""
-    logger.info("Проверяем новости...")
+
+async def periodic_news(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая проверка новостей и отправка новых постов в канал."""
+    logger.info("Проверяем новости…")
 
     try:
-        news_items = fetch_news()
+        news = fetch_news()
 
-        if not news_items:
+        if not news:
             logger.info("Свежих новостей нет.")
             return
 
-        for item in news_items:
+        count = 0  # сколько уже отправили за этот цикл
+
+        for item in news:
+            if count >= MAX_POSTS_PER_RUN:
+                logger.info("Достигнут лимит %d постов за цикл.", MAX_POSTS_PER_RUN)
+                break
+
             url = item["url"]
             if url in sent_urls:
                 continue
 
-            text = build_post_text(item)
+            post = build_post_text(item)
 
             try:
                 await context.bot.send_message(
                     chat_id=CHANNEL_ID,
-                    text=text,
+                    text=post,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=False,
                 )
@@ -241,29 +235,27 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 sent_urls.add(url)
                 save_sent_urls()
+                count += 1
 
             except Exception as e:
-                logger.exception("Ошибка отправки новости: %s", e)
-                await notify_admin(context, f"Ошибка отправки новости: {e}")
+                logger.exception("Ошибка отправки поста: %s", e)
+                await notify_admin(context, f"Ошибка отправки поста: {e}")
 
     except Exception as e:
-        logger.exception("Ошибка в periodic_news: %s", e)
-        await notify_admin(context, f"Ошибка в periodic_news: {e}")
+        logger.exception("Ошибка periodic_news: %s", e)
+        await notify_admin(context, f"Ошибка periodic_news: {e}")
 
 
 # ==========================
 #         HANDLERS
 # ==========================
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /start в личке с ботом."""
-    if update.effective_chat is None:
-        return
 
-    await update.effective_chat.send_message(
-        "👋 Привет! Я бот с новостями об искусственном интеллекте.\n\n"
-        "• Я собираю свежие новости из разных источников (Google News, Habr, Google AI, OpenAI).\n"
-        "• Публикую их в канале в коротком и понятном формате."
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет!\n"
+        "Это новостной бот об искусственном интеллекте.\n"
+        "Он публикует до 5 свежих новостей за один цикл без спама и дублей заголовка."
     )
 
 
@@ -271,25 +263,24 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 #          MAIN
 # ==========================
 
-def main() -> None:
-    logger.info("Запуск ai-news-bot")
 
+def main():
+    logger.info("Запуск ai-news-worker…")
     load_sent_urls()
 
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_handler))
 
-    # Периодическая проверка новостей
+    # периодический запуск
     app.job_queue.run_repeating(
         periodic_news,
         interval=NEWS_INTERVAL,
-        first=15,  # первая проверка через 15 секунд после старта
+        first=10,  # первая проверка через 10 секунд
         name="periodic_news",
     )
 
-    # Никакого asyncio.run, run_polling сам управляет циклом
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling()
 
 
 if __name__ == "__main__":
