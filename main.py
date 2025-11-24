@@ -1,11 +1,11 @@
 import os
 import logging
 import re
-from html import escape
+from html import unescape, escape
 from time import mktime
-from datetime import time, datetime
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict
+from typing import List, Dict, Set
 
 import feedparser
 from telegram import Update
@@ -16,171 +16,224 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# -------------------- НАСТРОЙКИ --------------------
+# ==========================
+#        НАСТРОЙКИ
+# ==========================
 
-TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN")
+TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+    or os.environ.get("BOT_TOKEN")
+    or os.environ.get("TOKEN")
+)
+
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
+ADMIN_ID = os.environ.get("ADMIN_ID")
 
 if not TOKEN:
-    raise RuntimeError("❌ Не задан BOT_TOKEN в переменных окружения!")
+    raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN!")
 
 if not CHANNEL_ID:
-    raise RuntimeError("❌ Не задан CHANNEL_ID в переменных окружения!")
+    raise RuntimeError("❌ Не найден CHANNEL_ID!")
 
+TZ = ZoneInfo("Asia/Dushanbe")
+
+# Интервал проверки новостей (секунды)
+NEWS_INTERVAL = 1800  # 30 минут
+
+# RSS-источники
 FEED_URLS = [
     "https://news.yandex.ru/computers.rss",
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-TZ = ZoneInfo("Asia/Dushanbe")
-NEWS_INTERVAL = 1800  # каждые 30 минут
+# файл сохранения отправленных ссылок
+SENT_URLS_FILE = "sent_urls.json"
+sent_urls: Set[str] = set()
 
-sent_urls = set()
-
-# ----------------------------------------------------
+# ==========================
+#          ЛОГИ
+# ==========================
 
 logging.basicConfig(
-    format="%(asctime)s — %(levelname)s — %(message)s",
+    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("ai-news-bot")
 
 
-# ----------------------------------------------------
-# ФУНКЦИЯ: создать текст новости
-# ----------------------------------------------------
-def build_news_text(title: str, summary: str) -> str:
-    """
-    Генерируем аккуратный текст новости, без бардака.
-    - Нет повторов заголовка
-    - Нормальный короткий смысловой текст
-    - Без шаблонного мусора
-    """
+# ==========================
+#     ВСПОМОГАТЕЛЬНЫЕ
+# ==========================
 
-    title_clean = title.strip()
-    summary_clean = summary.strip()
-
-    # Если summary повторяет title — не используем его
-    if summary_clean.lower().startswith(title_clean.lower()):
-        summary_clean = ""
-
-    # Если вообще нет summary — просто заголовок
-    if not summary_clean:
-        return title_clean
-
-    # Нормальный короткий текст
-    return f"{summary_clean}"
+def clean_html(text: str) -> str:
+    if not text:
+        return ""
+    text = unescape(text)
+    text = re.sub(r"<.*?>", "", text)
+    return text.strip()
 
 
-# ----------------------------------------------------
-# ФУНКЦИЯ: создать пост в Telegram
-# ----------------------------------------------------
-def build_post_text(item: Dict) -> str:
+def load_sent_urls() -> None:
+    """Загрузить отправленные ссылки."""
+    import json
+    global sent_urls
+
+    if not os.path.exists(SENT_URLS_FILE):
+        sent_urls = set()
+        return
+
+    try:
+        with open(SENT_URLS_FILE, "r", encoding="utf-8") as f:
+            sent_urls = set(json.load(f))
+        logger.info("Загружено %d отправленных ссылок.", len(sent_urls))
+    except:
+        sent_urls = set()
+
+
+def save_sent_urls() -> None:
+    """Сохранить отправленные ссылки."""
+    import json
+    try:
+        with open(SENT_URLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(sent_urls), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Ошибка сохранения ссылок: %s", e)
+
+
+async def notify_admin(context, text: str):
+    if ADMIN_ID:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text}")
+
+
+# ==========================
+#      ПАРСИНГ НОВОСТЕЙ
+# ==========================
+
+def fetch_news() -> List[Dict]:
+    items = []
+
+    for url in FEED_URLS:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                link = entry.get("link")
+                if not link or link in sent_urls:
+                    continue
+
+                title = entry.get("title", "").strip()
+                summary = entry.get("summary", "") or entry.get("description", "")
+
+                items.append(
+                    {
+                        "title": clean_html(title),
+                        "summary": clean_html(summary),
+                        "url": link,
+                    }
+                )
+        except Exception as e:
+            logger.exception("Ошибка RSS %s: %s", url, e)
+
+    return items
+
+
+def build_news_text(item: Dict) -> str:
     title = item["title"]
     summary = item["summary"]
-    url = item["url"]
 
-    body = build_news_text(title, summary)
+    # убрать дубли
+    if summary.lower().startswith(title.lower()):
+        summary = ""
 
-    safe_title = escape(title)
-    safe_body = escape(body)
-    safe_url = escape(url, quote=True)
+    if not summary:
+        return title
 
-    text = (
-        f"🧠 <b>{safe_title}</b>\n\n"
-        f"{safe_body}\n\n"
-        f"🔗 <a href=\"{safe_url}\">Источник</a>"
+    return summary
+
+
+def build_post_text(item: Dict) -> str:
+    title = escape(item["title"])
+    body = escape(build_news_text(item))
+    url = escape(item["url"], quote=True)
+
+    return (
+        f"🧠 <b>{title}</b>\n\n"
+        f"{body}\n\n"
+        f"🔗 <a href=\"{url}\">Источник</a>"
     )
 
-    return text
 
+# ==========================
+#      JOB: НОВОСТИ
+# ==========================
 
-# ----------------------------------------------------
-# Получение новостей
-# ----------------------------------------------------
-def fetch_news():
-    result = []
-
-    for feed_url in FEED_URLS:
-        feed = feedparser.parse(feed_url)
-
-        for entry in feed.entries:
-            link = entry.get("link")
-            if not link or link in sent_urls:
-                continue
-
-            title = entry.get("title", "").strip()
-            summary = entry.get("summary", "").strip()
-
-            result.append({
-                "title": title,
-                "summary": summary,
-                "url": link,
-            })
-
-    return result
-
-
-# ----------------------------------------------------
-# ПЕРИОДИЧЕСКАЯ ПРОВЕРКА НОВОСТЕЙ
-# ----------------------------------------------------
 async def periodic_news(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        news_list = fetch_news()
+    logger.info("Проверяем новости...")
 
-        for item in news_list:
+    try:
+        news = fetch_news()
+
+        if not news:
+            logger.info("Нет новых новостей.")
+            return
+
+        for item in news:
             url = item["url"]
 
             if url in sent_urls:
                 continue
 
-            sent_urls.add(url)
-
             post = build_post_text(item)
 
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=post,
+                    parse_mode=ParseMode.HTML,
+                )
+                logger.info("Отправил: %s", url)
+                sent_urls.add(url)
+                save_sent_urls()
 
-            logger.info(f"Отправлена новость: {url}")
+            except Exception as e:
+                logger.exception("Ошибка отправки поста: %s", e)
+                await notify_admin(context, f"Ошибка отправки поста: {e}")
 
     except Exception as e:
-        logger.error(f"Ошибка в periodic_news: {e}")
+        logger.exception("Ошибка periodic_news: %s", e)
+        await notify_admin(context, f"Ошибка periodic_news: {e}")
 
 
-# ----------------------------------------------------
-# Команда /start
-# ----------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==========================
+#         HANDLERS
+# ==========================
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот новостей об искусственном интеллекте.\n"
-        "Новости публикуются автоматически весь день."
+        "👋 Привет!\nЭто новостной бот ИИ.\nОн будет публиковать свежие новости в канал каждые 30 минут."
     )
 
 
-# ----------------------------------------------------
-# ОСНОВНОЙ ЗАПУСК
-# ----------------------------------------------------
+# ==========================
+#          MAIN
+# ==========================
+
 def main():
+    logger.info("Запуск бота…")
+    load_sent_urls()
+
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_handler))
 
-    # Периодическая публикация новостей
+    # периодический запуск
     app.job_queue.run_repeating(
         periodic_news,
         interval=NEWS_INTERVAL,
-        first=20,  # первая проверка через 20 сек
+        first=10,
     )
 
-    # Просто polling
     app.run_polling()
 
-
-# ----------------------------------------------------
 
 if __name__ == "__main__":
     main()
