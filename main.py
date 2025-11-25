@@ -20,8 +20,6 @@ from telegram.ext import (
 #        НАСТРОЙКИ
 # ==========================
 
-# Токен бота: основное имя TELEGRAM_BOT_TOKEN (как в Render),
-# BOT_TOKEN / TOKEN оставлены как запасные варианты.
 TOKEN = (
     os.environ.get("TELEGRAM_BOT_TOKEN")
     or os.environ.get("BOT_TOKEN")
@@ -29,7 +27,7 @@ TOKEN = (
 )
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID = os.environ.get("ADMIN_ID")  # опционально, чтобы получать ошибки в личку
+ADMIN_ID = os.environ.get("ADMIN_ID")  # опционально
 
 if not TOKEN:
     raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN / BOT_TOKEN / TOKEN в переменных окружения!")
@@ -37,23 +35,17 @@ if not TOKEN:
 if not CHANNEL_ID:
     raise RuntimeError("❌ Не найден CHANNEL_ID в переменных окружения!")
 
-# Часовой пояс (Душанбе)
 TZ = ZoneInfo("Asia/Dushanbe")
 
-# Интервал между проверками новостей (секунды)
-NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут по умолчанию
-
-# Максимум новостей за один цикл (anti-flood)
+NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут
 MAX_POSTS_PER_RUN = 5
 
-# RSS-источники (можно расширять)
 FEED_URLS: List[str] = [
     "https://news.yandex.ru/computers.rss",
     "https://news.yandex.ru/science.rss",
     "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
 ]
 
-# Файл, куда складываем уже обработанные ссылки
 SENT_URLS_FILE = "sent_urls.json"
 sent_urls: Set[str] = set()
 
@@ -73,7 +65,6 @@ logger = logging.getLogger("ai-news-bot")
 
 
 def clean_html(text: str) -> str:
-    """Убираем HTML-теги и лишние пробелы."""
     if not text:
         return ""
     text = unescape(text)
@@ -82,7 +73,6 @@ def clean_html(text: str) -> str:
 
 
 def load_sent_urls() -> None:
-    """Загрузить уже обработанные ссылки из файла."""
     import json
     global sent_urls
 
@@ -100,7 +90,6 @@ def load_sent_urls() -> None:
 
 
 def save_sent_urls() -> None:
-    """Сохранить уже обработанные ссылки в файл."""
     import json
     try:
         with open(SENT_URLS_FILE, "w", encoding="utf-8") as f:
@@ -110,7 +99,6 @@ def save_sent_urls() -> None:
 
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Отправить сообщение админу (если указан ADMIN_ID)."""
     if not ADMIN_ID:
         return
     try:
@@ -125,10 +113,6 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 def fetch_news() -> List[Dict]:
-    """
-    Читаем RSS-ленты и собираем новости, которых ещё не обрабатывали
-    (по ссылке).
-    """
     items: List[Dict] = []
 
     for feed_url in FEED_URLS:
@@ -155,15 +139,48 @@ def fetch_news() -> List[Dict]:
     return items
 
 
+def normalize_for_compare(text: str) -> str:
+    """
+    Нормализуем строку для сравнения:
+    - в нижний регистр
+    - убираем домены (*.ru, *.com и т.п.)
+    - убираем хвосты вида " - сайт ..." или " — сайт ..."
+    - убираем лишнюю пунктуацию
+    """
+    s = text.lower()
+
+    # убрать домены
+    s = re.sub(r"\b[\w.-]+\.(ru|com|org|net|io|ai|info|biz)\b", "", s)
+
+    # убрать хвосты " - что-то" / " — что-то"
+    s = re.sub(r"\s[-–—]\s.*$", "", s)
+
+    # оставить только буквы/цифры/пробелы
+    s = re.sub(r"[^a-zа-я0-9ё\s]", " ", s)
+
+    # схлопнуть пробелы
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s
+
+
+def jaccard_similarity(a: str, b: str) -> float:
+    """Простое сравнение по множеству слов."""
+    set_a = set(a.split())
+    set_b = set(b.split())
+    if not set_a or not set_b:
+        return 0.0
+    inter = set_a & set_b
+    union = set_a | set_b
+    return len(inter) / len(union)
+
+
 def build_body_text(title: str, summary: str) -> str:
     """
-    Формируем текст описания новости.
-
-    Жёсткое правило:
-    - если описания НЕТ → возвращаем пустую строку (такую новость не публикуем);
-    - если описание почти повторяет заголовок (разница только в маленьком "хвосте")
-      → тоже возвращаем пустую строку (не публикуем).
-    - только если summary реально отличается от title → возвращаем текст.
+    Возвращаем текст описания, если он реально отличается от заголовка.
+    Жёстко:
+    - если summary пустой → "" (новость НЕ публикуем);
+    - если summary по сути дублирует title → "" (новость НЕ публикуем).
     """
     title_clean = clean_html(title)
     summary_clean = clean_html(summary)
@@ -171,48 +188,31 @@ def build_body_text(title: str, summary: str) -> str:
     if not summary_clean:
         return ""
 
-    t = title_clean.lower().strip()
-    s = summary_clean.lower().strip()
+    t_norm = normalize_for_compare(title_clean)
+    s_norm = normalize_for_compare(summary_clean)
 
-    def almost_same(a: str, b: str) -> bool:
-        """Почти одинаковые строки (учитываем только маленький хвост)."""
-        if not a or not b:
-            return False
-
-        if a == b:
-            return True
-
-        # если одна строка содержится в другой,
-        # а хвост не длиннее 15 символов (часто это просто домен или пара слов)
-        if a in b and len(b) - len(a) <= 15:
-            return True
-        if b in a and len(a) - len(b) <= 15:
-            return True
-
-        return False
-
-    if almost_same(t, s):
-        # summary по сути повторяет заголовок — считаем бессмысленным
+    if not t_norm or not s_norm:
         return ""
 
-    # нормальное отдельное описание
+    # если полностью совпали
+    if t_norm == s_norm:
+        return ""
+
+    # если одна почти целиком содержит другую
+    big, small = (t_norm, s_norm) if len(t_norm) >= len(s_norm) else (s_norm, t_norm)
+    if small in big and len(small) / len(big) >= 0.7:
+        return ""
+
+    # если похожесть по словам очень большая — считаем дублем
+    sim = jaccard_similarity(t_norm, s_norm)
+    if sim >= 0.8:
+        return ""
+
+    # дошли сюда — описание достаточно отличается
     return summary_clean
 
 
 def build_post_text(title: str, body: str, url: str) -> str:
-    """
-    Формируем финальный текст поста для Telegram.
-
-    Формат:
-    🧠 <жирный заголовок>
-
-    <описание>
-
-    🔗 Источник
-
-    В эту функцию попадают ТОЛЬКО те новости, у которых описание
-    реально есть и не дублирует заголовок.
-    """
     safe_title = escape(title)
     safe_body = escape(body)
     safe_url = escape(url, quote=True)
@@ -224,7 +224,6 @@ def build_post_text(title: str, body: str, url: str) -> str:
         "",
         f'🔗 <a href="{safe_url}">Источник</a>',
     ]
-
     return "\n".join(lines)
 
 
@@ -235,12 +234,12 @@ def build_post_text(title: str, body: str, url: str) -> str:
 
 async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Периодическая проверка новостей и отправка новых постов в канал.
+    Периодическая проверка новостей.
 
-    ВАЖНО:
+    Жёсткое правило:
     - если описания нет или оно дублирует заголовок → новость НЕ публикуем;
-    - но ссылку помечаем как обработанную, чтобы не проверять её каждый раз;
-    - за один запуск отправляем максимум MAX_POSTS_PER_RUN постов.
+    - но ссылку помечаем как обработанную;
+    - максимум MAX_POSTS_PER_RUN постов за один цикл.
     """
     logger.info("Проверяем новости…")
 
@@ -251,7 +250,7 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Свежих новостей нет.")
             return
 
-        count = 0  # сколько уже отправили в этом цикле
+        count = 0
 
         for item in news:
             if count >= MAX_POSTS_PER_RUN:
@@ -267,7 +266,7 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             body = build_body_text(title, summary)
 
-            # Если описания нет или оно почти дублирует заголовок — пропускаем новость
+            # если нормального описания нет — пропускаем
             if not body:
                 logger.info("Пропускаем новость без нормального описания: %s", url)
                 sent_urls.add(url)
@@ -304,15 +303,14 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /start в личке с ботом."""
     if update.effective_chat is None:
         return
 
     await update.effective_chat.send_message(
         "👋 Привет!\n"
         "Это новостной бот об искусственном интеллекте.\n"
-        "Он публикует только те новости, где есть нормальное описание,\n"
-        "и не дублирует заголовок. Максимум 5 постов за один цикл."
+        "Он публикует только те новости, у которых есть нормальное описание,\n"
+        "и не дублирует заголовок. Максимум 5 постов за цикл."
     )
 
 
@@ -329,11 +327,10 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start_handler))
 
-    # периодический запуск
     app.job_queue.run_repeating(
         periodic_news,
         interval=NEWS_INTERVAL,
-        first=10,  # первая проверка через 10 секунд после запуска
+        first=10,
         name="periodic_news",
     )
 
