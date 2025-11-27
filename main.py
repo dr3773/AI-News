@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 
 # ==========================
-#        РќРђРЎРўР РћР™РљР
+#        НАСТРОЙКИ
 # ==========================
 
 TOKEN = (
@@ -27,43 +27,43 @@ TOKEN = (
 )
 
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID = os.environ.get("ADMIN_ID")  # РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ
+ADMIN_ID = os.environ.get("ADMIN_ID")  # опционально
 
 if not TOKEN:
-    raise RuntimeError("вќЊ РќРµ РЅР°Р№РґРµРЅ TELEGRAM_BOT_TOKEN / BOT_TOKEN / TOKEN!")
+    raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN / BOT_TOKEN / TOKEN!")
 
 if not CHANNEL_ID:
-    raise RuntimeError("вќЊ РќРµ РЅР°Р№РґРµРЅ CHANNEL_ID РІ РїРµСЂРµРјРµРЅРЅС‹С… РѕРєСЂСѓР¶РµРЅРёСЏ!")
+    raise RuntimeError("❌ Не найден CHANNEL_ID в переменных окружения!")
 
 TZ = ZoneInfo("Asia/Dushanbe")
 
-NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 РјРёРЅСѓС‚
+NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут
 MAX_POSTS_PER_RUN = 5
 
 FEED_URLS: List[str] = [
-    "https://news.google.com/rss/search?q=РёСЃРєСѓСЃСЃС‚РІРµРЅРЅС‹Р№+РёРЅС‚РµР»Р»РµРєС‚&hl=ru&gl=RU&ceid=RU:ru",
-    "https://www.cnews.ru/inc/rss/news_top.xml",  # Р”РѕР±Р°РІР»РµРЅ IT/Tech РёСЃС‚РѕС‡РЅРёРє
+    "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
+    "https://www.cnews.ru/inc/rss/news_top.xml",
 ]
 
 SENT_URLS_FILE = "sent_urls.json"
 sent_urls: Set[str] = set()
 
-DEFAULT_IMAGE = "https://cdn0.tnwcdn.com/wp-content/blogs.dir/1/files/2010/06/News.jpg"  # РІР°С€ fallback
+DEFAULT_IMAGE = "https://cdn0.tnwcdn.com/wp-content/blogs.dir/1/files/2010/06/News.jpg"
 
 
 # ==========================
-#          Р›РћР“Р
+#          ЛОГИ
 # ==========================
 
 logging.basicConfig(
-    format="%(asctime)s вЂ” %(name)s вЂ” %(levelname)s вЂ” %(message)s",
+    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("ai-news-bot")
 
 
 # ==========================
-#     Р’РЎРџРћРњРћР“РђРўР•Р›Р¬РќР«Р•
+#     ВСПОМОГАТЕЛЬНЫЕ
 # ==========================
 
 def clean_html(text: str) -> str:
@@ -85,9 +85,9 @@ def load_sent_urls() -> None:
     try:
         with open(SENT_URLS_FILE, "r", encoding="utf-8") as f:
             sent_urls = set(json.load(f))
-        logger.info("Р—Р°РіСЂСѓР¶РµРЅРѕ %d РѕР±СЂР°Р±РѕС‚Р°РЅРЅС‹С… СЃСЃС‹Р»РѕРє.", len(sent_urls))
+        logger.info("Загружено %d обработанных ссылок.", len(sent_urls))
     except Exception as e:
-        logger.exception("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ %s: %s", SENT_URLS_FILE, e)
+        logger.exception("Не удалось загрузить %s: %s", SENT_URLS_FILE, e)
         sent_urls = set()
 
 
@@ -97,21 +97,43 @@ def save_sent_urls() -> None:
         with open(SENT_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(sent_urls), f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.exception("РћС€РёР±РєР° СЃРѕС…СЂР°РЅРµРЅРёСЏ СЃСЃС‹Р»РѕРє: %s", e)
+        logger.exception("Ошибка сохранения ссылок: %s", e)
 
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if not ADMIN_ID:
         return
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"вљ пёЏ {text}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text}")
     except Exception:
-        logger.exception("РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ СЃРѕРѕР±С‰РµРЅРёРµ Р°РґРјРёРЅСѓ.")
+        logger.exception("Не удалось отправить сообщение админу.")
 
 
 # ==========================
-#      РџРђР РЎРРќР“ РќРћР’РћРЎРўР•Р™
+#      ПАРСИНГ НОВОСТЕЙ
 # ==========================
+
+def extract_image(entry) -> str:
+    # Google News
+    if "media_content" in entry and entry.media_content:
+        url = entry.media_content[0].get("url")
+        if url:
+            return url
+
+    if "media_thumbnail" in entry and entry.media_thumbnail:
+        url = entry.media_thumbnail[0].get("url")
+        if url:
+            return url
+
+    # CNews <enclosure>
+    enclosure = entry.get("enclosures")
+    if enclosure and len(enclosure) > 0:
+        url = enclosure[0].get("href") or enclosure[0].get("url")
+        if url:
+            return url
+
+    return DEFAULT_IMAGE
+
 
 def fetch_news() -> List[Dict]:
     items: List[Dict] = []
@@ -125,15 +147,15 @@ def fetch_news() -> List[Dict]:
                     continue
 
                 title = entry.get("title", "").strip()
-                summary = (entry.get("summary", "") or entry.get("description", ""))
-                summary = summary.split("<br")[0]  # СѓР±РёСЂР°РµРј РїРѕРІС‚РѕСЂС‹ РёР· Google News
-
-                # Р±РµСЂС‘Рј РїРѕРїС‹С‚РєСѓ РєР°СЂС‚РёРЅРєРё
-                image = (
-                    entry.get("media_content", [{}])[0].get("url")
-                    or entry.get("media_thumbnail", [{}])[0].get("url")
-                    or DEFAULT_IMAGE
+                summary = (
+                    entry.get("summary", "")
+                    or entry.get("description", "")
+                    or ""
                 )
+
+                summary = summary.split("<br")[0]
+
+                image = extract_image(entry)
 
                 items.append(
                     {
@@ -145,7 +167,7 @@ def fetch_news() -> List[Dict]:
                 )
 
         except Exception as e:
-            logger.exception("РћС€РёР±РєР° RSS %s: %s", feed_url, e)
+            logger.exception("Ошибка RSS %s: %s", feed_url, e)
 
     return items
 
@@ -153,8 +175,8 @@ def fetch_news() -> List[Dict]:
 def normalize_for_compare(text: str) -> str:
     s = text.lower()
     s = re.sub(r"\b[\w.-]+\.(ru|com|org|net|io|ai|info|biz)\b", "", s)
-    s = re.sub(r"\s[-вЂ“вЂ”]\s.*$", "", s)
-    s = re.sub(r"[^a-zР°-СЏ0-9С‘\s]", " ", s)
+    s = re.sub(r"\s[-–—]\s.*$", "", s)
+    s = re.sub(r"[^a-zа-я0-9ё\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -195,23 +217,23 @@ def build_post_text(title: str, body: str, url: str) -> str:
     safe_url = escape(url, quote=True)
 
     return (
-        f"рџ§  <b>{safe_title}</b>\n\n"
+        f"🧠 <b>{safe_title}</b>\n\n"
         f"{safe_body}\n\n"
-        f'<a href="{safe_url}">РСЃС‚РѕС‡РЅРёРє</a>'
+        f'<a href="{safe_url}">Источник</a>'
     )
 
 
 # ==========================
-#      JOB: РќРћР’РћРЎРўР
+#      JOB: НОВОСТИ
 # ==========================
 
 async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("РџСЂРѕРІРµСЂСЏРµРј РЅРѕРІРѕСЃС‚РёвЂ¦")
+    logger.info("Проверяем новости…")
 
     try:
         news = fetch_news()
         if not news:
-            logger.info("РЎРІРµР¶РёС… РЅРѕРІРѕСЃС‚РµР№ РЅРµС‚.")
+            logger.info("Свежих новостей нет.")
             return
 
         count = 0
@@ -229,7 +251,7 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             body = build_body_text(title, summary)
-            if not body:  # РЅРµС‚ РЅРѕСЂРјР°Р»СЊРЅРѕРіРѕ РѕРїРёСЃР°РЅРёСЏ
+            if not body:
                 sent_urls.add(url)
                 save_sent_urls()
                 continue
@@ -241,21 +263,21 @@ async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=CHANNEL_ID,
                     photo=image,
                     caption=post,
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
                 )
-                logger.info("РћС‚РїСЂР°РІР»РµРЅР° РЅРѕРІРѕСЃС‚СЊ: %s", url)
+                logger.info("Отправлена новость: %s", url)
 
                 sent_urls.add(url)
                 save_sent_urls()
                 count += 1
 
             except Exception as e:
-                logger.exception("РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё РїРѕСЃС‚Р°: %s", e)
-                await notify_admin(context, f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё РїРѕСЃС‚Р°: {e}")
+                logger.exception("Ошибка отправки поста: %s", e)
+                await notify_admin(context, f"Ошибка отправки поста: {e}")
 
     except Exception as e:
-        logger.exception("РћС€РёР±РєР° periodic_news: %s", e)
-        await notify_admin(context, f"РћС€РёР±РєР° periodic_news: {e}")
+        logger.exception("Ошибка periodic_news: %s", e)
+        await notify_admin(context, f"Ошибка periodic_news: {e}")
 
 
 # ==========================
@@ -267,11 +289,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await update.effective_chat.send_message(
-        "рџ‘‹ РџСЂРёРІРµС‚!\n"
-        "Р­С‚Рѕ Р±РѕС‚ РЅРѕРІРѕСЃС‚РµР№ РїСЂРѕ РСЃРєСѓСЃСЃС‚РІРµРЅРЅС‹Р№ РРЅС‚РµР»Р»РµРєС‚.\n"
-        "вњ” РўРѕР»СЊРєРѕ СѓРЅРёРєР°Р»СЊРЅРѕРµ РѕРїРёСЃР°РЅРёРµ\n"
-        "вњ” Р‘РµР· РґСѓР±Р»РµР№\n"
-        "вњ” РЎ РєР°СЂС‚РёРЅРєР°РјРё рџЋ"
+        "👋 Привет!\n"
+        "Это бот новостей про Искусственный Интеллект.\n"
+        "✔ Только уникальное описание\n"
+        "✔ Без дублей\n"
+        "✔ С картинками 😎"
     )
 
 
@@ -280,7 +302,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ==========================
 
 def main() -> None:
-    logger.info("Р—Р°РїСѓСЃРє ai-news-workerвЂ¦")
+    logger.info("Запуск ai-news-worker…")
     load_sent_urls()
 
     app = Application.builder().token(TOKEN).build()
@@ -298,4 +320,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
