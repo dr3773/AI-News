@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, date
 
 import feedparser
-from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram import Bot, Dispatcher, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message
@@ -14,51 +14,48 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
+
 # -------------------- НАСТРОЙКИ --------------------
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")  # ID или @username канала
+NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
 
 if not BOT_TOKEN or not NEWS_CHAT_ID:
     raise RuntimeError("Нужно задать BOT_TOKEN и NEWS_CHAT_ID в переменных окружения!")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"
 )
 
 logger = logging.getLogger(__name__)
 
-# RSS-ленты. Добавляй / меняй по вкусу
 NEWS_FEEDS = [
-    # Зарубежные про ИИ
     {
         "name": "404 Media",
-        "url": "https://www.404media.co/rss",
+        "url": "https://www.404media.co/rss"
     },
     {
         "name": "Ahead of AI",
-        "url": "https://www.aheadofai.com/rss/",
+        "url": "https://www.aheadofai.com/rss/"
     },
-    # Российские / русскоязычные про ИИ
     {
         "name": "Forklog AI",
-        "url": "https://forklog.com/tag/iskusstvennyj-intellekt/feed",
+        "url": "https://forklog.com/tag/iskusstvennyj-intellekt/feed"
     },
     {
         "name": "CNews AI",
-        "url": "https://www.cnews.ru/inc/rss/news/tag/iskusstvennyj_intellekt",
+        "url": "https://www.cnews.ru/inc/rss/news/tag/iskusstvennyj_intellekt"
     },
     {
         "name": "Lenta.ru – Технологии",
-        "url": "https://lenta.ru/rss/top7",  # при желании можно отфильтровать по ИИ по ключевым словам
-    },
+        "url": "https://lenta.ru/rss/top7"
+    }
 ]
 
 DB_PATH = "news.db"
-
 # -------------------- РАБОТА С БД --------------------
 
 
@@ -93,14 +90,13 @@ def save_news(url: str, title: str, source: str, published_at: datetime):
     cur = conn.cursor()
     cur.execute(
         "INSERT OR IGNORE INTO news (url, title, source, published_at) VALUES (?, ?, ?, ?)",
-        (url, title, source, published_at.isoformat()),
+        (url, title, source, published_at.isoformat())
     )
     conn.commit()
     conn.close()
 
 
 def get_today_news():
-    """Все новости за сегодняшний день для дайджеста."""
     today_str = date.today().isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -111,28 +107,23 @@ def get_today_news():
         WHERE DATE(published_at) = ?
         ORDER BY published_at ASC
         """,
-        (today_str,),
+        (today_str,)
     )
     rows = cur.fetchall()
     conn.close()
     return rows
-
-
-# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
+    # -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 
 
 def shorten_text(text: str, max_len: int = 180) -> str:
-    """Укорачиваем заголовок/описание, чтобы не было полотна."""
     if len(text) <= max_len:
         return text
     return text[: max_len - 3].rstrip() + "..."
 
 
 def split_message(text: str, limit: int = 4000):
-    """Делим длинный текст на части для Telegram (лимит ~4096 символов)."""
     parts = []
     while len(text) > limit:
-        # режем по ближайшему переводу строки
         cut_pos = text.rfind("\n\n", 0, limit)
         if cut_pos == -1:
             cut_pos = limit
@@ -140,20 +131,16 @@ def split_message(text: str, limit: int = 4000):
         text = text[cut_pos:]
     parts.append(text)
     return parts
-
-
 # -------------------- ОСНОВНАЯ ЛОГИКА НОВОСТЕЙ --------------------
 
 
 async def fetch_and_send_news(bot: Bot):
-    """Проверяем новые новости и отправляем только то, чего ещё не было."""
     logger.info("Проверка новых новостей...")
     total_new = 0
 
     for feed in NEWS_FEEDS:
         source_name = feed["name"]
-
-url = feed["url"]
+        url = feed["url"]
 
         try:
             parsed = feedparser.parse(url)
@@ -169,9 +156,8 @@ url = feed["url"]
                 continue
 
             if news_exists(link):
-                continue  # уже было
+                continue
 
-            # Дата
             published = datetime.now()
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 try:
@@ -181,14 +167,13 @@ url = feed["url"]
                         entry.published_parsed.tm_mday,
                         entry.published_parsed.tm_hour,
                         entry.published_parsed.tm_min,
-                        entry.published_parsed.tm_sec,
+                        entry.published_parsed.tm_sec
                     )
                 except Exception:
                     pass
 
             short_title = shorten_text(title)
 
-            # Формируем сообщение для ОДНОЙ новости
             text = (
                 f"🧠 <b>{short_title}</b>\n"
                 f"<i>{source_name}</i>\n"
@@ -200,11 +185,11 @@ url = feed["url"]
                     chat_id=NEWS_CHAT_ID,
                     text=text,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
+                    disable_web_page_preview=False
                 )
                 save_news(link, title, source_name, published)
                 total_new += 1
-                await asyncio.sleep(1)  # чтобы не спамить слишком быстро
+                await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Ошибка отправки новости: {e}")
 
@@ -212,7 +197,6 @@ url = feed["url"]
 
 
 async def send_evening_digest(bot: Bot):
-    """Вечерний дайджест за сегодня. Ссылки у слова 'Источник' как и в обычных новостях."""
     logger.info("Формирование вечернего дайджеста...")
     rows = get_today_news()
 
@@ -221,7 +205,8 @@ async def send_evening_digest(bot: Bot):
         return
 
     header = (
-        f"🍔 <b>Вечерний дайджест ИИ-новостей за {date.today().strftime('%d.%m.%Y')}:</b>\n\n"
+        f"🍔 <b>Вечерний дайджест ИИ-новостей за "
+        f"{date.today().strftime('%d.%m.%Y')}:</b>\n\n"
     )
 
     body_lines = []
@@ -234,8 +219,6 @@ async def send_evening_digest(bot: Bot):
         body_lines.append(line)
 
     full_text = header + "\n".join(body_lines)
-
-    # Делим на части, если слишком длинно
     parts = split_message(full_text)
 
     try:
@@ -244,14 +227,12 @@ async def send_evening_digest(bot: Bot):
                 chat_id=NEWS_CHAT_ID,
                 text=part,
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+                disable_web_page_preview=True
             )
             await asyncio.sleep(1)
         logger.info("Вечерний дайджест отправлен.")
     except Exception as e:
-        logger.error(f"Ошибка отправки вечернего дайджеста: {e}")
-
-
+        logger.error(f"Ошибка отправки вечернего дайджеста: {e}") 
 # -------------------- TELEGRAM-БОТ --------------------
 
 router = Router()
@@ -262,7 +243,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я бот канала «AI News | ИИ Новости».\n"
         "Новости публикуются автоматически в канал.\n"
-        "Здесь можно только проверить, что бот жив 😊"
+        "Здесь можно только проверить, что бот работает 🙂"
     )
 
 
@@ -273,25 +254,22 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")  # при желании поменяй
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-    # каждые 30 минут — проверка новых новостей
     scheduler.add_job(
         fetch_and_send_news,
         IntervalTrigger(minutes=30),
         args=(bot,),
         id="fetch_news_job",
-        replace_existing=True,
+        replace_existing=True
     )
 
-    # каждый день в 21:00 — вечерний дайджест
     scheduler.add_job(
-
-send_evening_digest,
+        send_evening_digest,
         CronTrigger(hour=21, minute=0),
         args=(bot,),
         id="evening_digest_job",
-        replace_existing=True,
+        replace_existing=True
     )
 
     scheduler.start()
