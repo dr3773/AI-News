@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, date
+import re
 
 import feedparser
 from aiogram import Bot, Dispatcher, Router
@@ -13,7 +14,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
-
 
 # -------------------- НАСТРОЙКИ --------------------
 
@@ -32,15 +32,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Оставлены только русскоязычные источники
 NEWS_FEEDS = [
-    {
-        "name": "404 Media",
-        "url": "https://www.404media.co/rss"
-    },
-    {
-        "name": "Ahead of AI",
-        "url": "https://www.aheadofai.com/rss/"
-    },
     {
         "name": "Forklog AI",
         "url": "https://forklog.com/tag/iskusstvennyj-intellekt/feed"
@@ -50,23 +43,28 @@ NEWS_FEEDS = [
         "url": "https://www.cnews.ru/inc/rss/news/tag/iskusstvennyj_intellekt"
     },
     {
-        "name": "Lenta.ru – Технологии",
+        "name": "Lenta.ru — Технологии",
         "url": "https://lenta.ru/rss/top7"
     }
 ]
 
 DB_PATH = "news.db"
+
 # -------------------- РАБОТА С БД --------------------
 
-
 def init_db():
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS news (
+        CREATE TABLE news (
             url TEXT PRIMARY KEY,
             title TEXT,
+            description TEXT,
+            image_url TEXT,
             source TEXT,
             published_at TEXT
         )
@@ -80,17 +78,17 @@ def news_exists(url: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM news WHERE url = ?", (url,))
-    row = cur.fetchone()
+    found = cur.fetchone() is not None
     conn.close()
-    return row is not None
+    return found
 
 
-def save_news(url: str, title: str, source: str, published_at: datetime):
+def save_news(url, title, description, image_url, source, published_at):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO news (url, title, source, published_at) VALUES (?, ?, ?, ?)",
-        (url, title, source, published_at.isoformat())
+        "INSERT OR IGNORE INTO news (url, title, description, image_url, source, published_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (url, title, description, image_url, source, published_at.isoformat())
     )
     conn.commit()
     conn.close()
@@ -102,7 +100,7 @@ def get_today_news():
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT title, url, source, published_at
+        SELECT title, description, url, source, published_at
         FROM news
         WHERE DATE(published_at) = ?
         ORDER BY published_at ASC
@@ -112,10 +110,11 @@ def get_today_news():
     rows = cur.fetchall()
     conn.close()
     return rows
-    # -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 
-def shorten_text(text: str, max_len: int = 180) -> str:
+def shorten_text(text: str, max_len: int = 280) -> str:
+    text = re.sub(r"<.*?>", "", text)
     if len(text) <= max_len:
         return text
     return text[: max_len - 3].rstrip() + "..."
@@ -131,8 +130,33 @@ def split_message(text: str, limit: int = 4000):
         text = text[cut_pos:]
     parts.append(text)
     return parts
-# -------------------- ОСНОВНАЯ ЛОГИКА НОВОСТЕЙ --------------------
 
+
+def extract_image(entry):
+    # 1 — media:thumbnail
+    if "media_thumbnail" in entry and entry.media_thumbnail:
+        return entry.media_thumbnail[0].get("url")
+
+    # 2 — media:content
+    if "media_content" in entry and entry.media_content:
+        return entry.media_content[0].get("url")
+
+    # 3 — enclosures
+    if hasattr(entry, "enclosures"):
+        for e in entry.enclosures:
+            if "image" in e.get("type", ""):
+                return e.get("href")
+
+    # 4 — <img> inside summary
+    summary = entry.get("summary", "")
+    m = re.search(r'<img[^>]+src="([^"]+)"', summary)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+# -------------------- ОСНОВНАЯ ЛОГИКА НОВОСТЕЙ --------------------
 
 async def fetch_and_send_news(bot: Bot):
     logger.info("Проверка новых новостей...")
@@ -151,6 +175,7 @@ async def fetch_and_send_news(bot: Bot):
         for entry in parsed.entries:
             link = entry.get("link")
             title = entry.get("title", "").strip()
+            description = entry.get("summary") or entry.get("description") or title
 
             if not link or not title:
                 continue
@@ -167,29 +192,40 @@ async def fetch_and_send_news(bot: Bot):
                         entry.published_parsed.tm_mday,
                         entry.published_parsed.tm_hour,
                         entry.published_parsed.tm_min,
-                        entry.published_parsed.tm_sec
+                        entry.published_parsed.tm_sec,
                     )
                 except Exception:
                     pass
+
+            image_url = extract_image(entry)
 
             short_title = shorten_text(title)
 
             text = (
                 f"🧠 <b>{short_title}</b>\n"
                 f"<i>{source_name}</i>\n"
-                f"<a href=\"{link}\">Источник</a>"
+                f"<a href=\"{link}\">Читать полностью</a>"
             )
 
             try:
-                await bot.send_message(
-                    chat_id=NEWS_CHAT_ID,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False
-                )
-                save_news(link, title, source_name, published)
+                if image_url:
+                    await bot.send_photo(
+                        chat_id=NEWS_CHAT_ID,
+                        photo=image_url,
+                        caption=text,
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=NEWS_CHAT_ID,
+                        text=text,
+                        parse_mode=ParseMode.HTML
+                    )
+
+                save_news(link, title, description, image_url, source_name, published)
                 total_new += 1
                 await asyncio.sleep(1)
+
             except Exception as e:
                 logger.error(f"Ошибка отправки новости: {e}")
 
@@ -210,10 +246,12 @@ async def send_evening_digest(bot: Bot):
     )
 
     body_lines = []
-    for i, (title, url, source, published_at) in enumerate(rows, start=1):
-        short_title = shorten_text(title, 220)
+    for i, (title, description, url, source, published_at) in enumerate(rows, start=1):
+        desc = description or title
+        short_desc = shorten_text(desc, 300)
+
         line = (
-            f"{i}. {short_title}\n"
+            f"{i}. {short_desc}\n"
             f"<i>{source}</i> — <a href=\"{url}\">Источник</a>\n"
         )
         body_lines.append(line)
@@ -232,7 +270,8 @@ async def send_evening_digest(bot: Bot):
             await asyncio.sleep(1)
         logger.info("Вечерний дайджест отправлен.")
     except Exception as e:
-        logger.error(f"Ошибка отправки вечернего дайджеста: {e}") 
+        logger.error(f"Ошибка отправки вечернего дайджеста: {e}")
+
 # -------------------- TELEGRAM-БОТ --------------------
 
 router = Router()
@@ -281,5 +320,5 @@ async def main():
         await bot.session.close()
 
 
-if name == "__main__":
+if __name__ == "__main__":
     asyncio.run(main())
