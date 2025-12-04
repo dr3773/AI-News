@@ -1,322 +1,324 @@
 import os
+import asyncio
 import logging
+import sqlite3
+from datetime import datetime, date
 import re
-from html import unescape, escape
-from datetime import datetime
-from time import mktime
-from zoneinfo import ZoneInfo
-from typing import List, Dict, Set
 
 import feedparser
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from aiogram import Bot, Dispatcher, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from dotenv import load_dotenv
 
-# ==========================
-#        НАСТРОЙКИ
-# ==========================
+# -------------------- НАСТРОЙКИ --------------------
 
-TOKEN = (
-    os.environ.get("TELEGRAM_BOT_TOKEN")
-    or os.environ.get("BOT_TOKEN")
-    or os.environ.get("TOKEN")
-)
+load_dotenv()
 
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-ADMIN_ID = os.environ.get("ADMIN_ID")  # опционально
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+NEWS_CHAT_ID = os.getenv("NEWS_CHAT_ID")
 
-if not TOKEN:
-    raise RuntimeError("❌ Не найден TELEGRAM_BOT_TOKEN / BOT_TOKEN / TOKEN!")
-
-if not CHANNEL_ID:
-    raise RuntimeError("❌ Не найден CHANNEL_ID в переменных окружения!")
-
-TZ = ZoneInfo("Asia/Dushanbe")
-
-NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", "1800"))  # 30 минут
-MAX_POSTS_PER_RUN = 5
-
-FEED_URLS: List[str] = [
-    "https://news.google.com/rss/search?q=искусственный+интеллект&hl=ru&gl=RU&ceid=RU:ru",
-    "https://www.cnews.ru/inc/rss/news_top.xml",
-]
-
-SENT_URLS_FILE = "sent_urls.json"
-sent_urls: Set[str] = set()
-
-DEFAULT_IMAGE = "https://cdn0.tnwcdn.com/wp-content/blogs.dir/1/files/2010/06/News.jpg"
-
-
-# ==========================
-#          ЛОГИ
-# ==========================
+if not BOT_TOKEN or not NEWS_CHAT_ID:
+    raise RuntimeError("Нужно задать BOT_TOKEN и NEWS_CHAT_ID в переменных окружения!")
 
 logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"
 )
-logger = logging.getLogger("ai-news-bot")
 
+logger = logging.getLogger(__name__)
 
-# ==========================
-#     ВСПОМОГАТЕЛЬНЫЕ
-# ==========================
+# Оставлены только русскоязычные источники
+NEWS_FEEDS = [
+    {
+        "name": "Forklog AI",
+        "url": "https://forklog.com/tag/iskusstvennyj-intellekt/feed"
+    },
+    {
+        "name": "CNews AI",
+        "url": "https://www.cnews.ru/inc/rss/news/tag/iskusstvennyj_intellekt"
+    },
+    {
+        "name": "Lenta.ru — Технологии",
+        "url": "https://lenta.ru/rss/top7"
+    }
+]
 
-def clean_html(text: str) -> str:
-    if not text:
-        return ""
-    text = unescape(text)
-    text = re.sub(r"<.*?>", "", text)
-    return text.strip()
+DB_PATH = "news.db"
 
+# -------------------- РАБОТА С БД --------------------
 
-def load_sent_urls() -> None:
-    import json
-    global sent_urls
+def init_db():
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
 
-    if not os.path.exists(SENT_URLS_FILE):
-        sent_urls = set()
-        return
-
-    try:
-        with open(SENT_URLS_FILE, "r", encoding="utf-8") as f:
-            sent_urls = set(json.load(f))
-        logger.info("Загружено %d обработанных ссылок.", len(sent_urls))
-    except Exception as e:
-        logger.exception("Не удалось загрузить %s: %s", SENT_URLS_FILE, e)
-        sent_urls = set()
-
-
-def save_sent_urls() -> None:
-    import json
-    try:
-        with open(SENT_URLS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(sent_urls), f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.exception("Ошибка сохранения ссылок: %s", e)
-
-
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    if not ADMIN_ID:
-        return
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ {text}")
-    except Exception:
-        logger.exception("Не удалось отправить сообщение админу.")
-
-
-# ==========================
-#      ПАРСИНГ НОВОСТЕЙ
-# ==========================
-
-def extract_image(entry) -> str:
-    # Google News
-    if "media_content" in entry and entry.media_content:
-        url = entry.media_content[0].get("url")
-        if url:
-            return url
-
-    if "media_thumbnail" in entry and entry.media_thumbnail:
-        url = entry.media_thumbnail[0].get("url")
-        if url:
-            return url
-
-    # CNews <enclosure>
-    enclosure = entry.get("enclosures")
-    if enclosure and len(enclosure) > 0:
-        url = enclosure[0].get("href") or enclosure[0].get("url")
-        if url:
-            return url
-
-    return DEFAULT_IMAGE
-
-
-def fetch_news() -> List[Dict]:
-    items: List[Dict] = []
-
-    for feed_url in FEED_URLS:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries:
-                link = entry.get("link")
-                if not link or link in sent_urls:
-                    continue
-
-                title = entry.get("title", "").strip()
-                summary = (
-                    entry.get("summary", "")
-                    or entry.get("description", "")
-                    or ""
-                )
-
-                summary = summary.split("<br")[0]
-
-                image = extract_image(entry)
-
-                items.append(
-                    {
-                        "title": clean_html(title),
-                        "summary": clean_html(summary),
-                        "url": link,
-                        "image": image,
-                    }
-                )
-
-        except Exception as e:
-            logger.exception("Ошибка RSS %s: %s", feed_url, e)
-
-    return items
-
-
-def normalize_for_compare(text: str) -> str:
-    s = text.lower()
-    s = re.sub(r"\b[\w.-]+\.(ru|com|org|net|io|ai|info|biz)\b", "", s)
-    s = re.sub(r"\s[-–—]\s.*$", "", s)
-    s = re.sub(r"[^a-zа-я0-9ё\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def jaccard_similarity(a: str, b: str) -> float:
-    set_a = set(a.split())
-    set_b = set(b.split())
-    if not set_a or not set_b:
-        return 0.0
-    return len(set_a & set_b) / len(set_a | set_b)
-
-
-def build_body_text(title: str, summary: str) -> str:
-    title_clean = clean_html(title)
-    summary_clean = clean_html(summary)
-
-    if not summary_clean:
-        return ""
-
-    t_norm = normalize_for_compare(title_clean)
-    s_norm = normalize_for_compare(summary_clean)
-
-    if not t_norm or not s_norm or t_norm == s_norm:
-        return ""
-
-    big, small = (t_norm, s_norm) if len(t_norm) >= len(s_norm) else (s_norm, t_norm)
-    if small in big and len(small) / len(big) >= 0.7:
-        return ""
-
-    if jaccard_similarity(t_norm, s_norm) >= 0.8:
-        return ""
-
-    return summary_clean
-
-
-def build_post_text(title: str, body: str, url: str) -> str:
-    safe_title = escape(title)
-    safe_body = escape(body)
-    safe_url = escape(url, quote=True)
-
-    return (
-        f"🧠 <b>{safe_title}</b>\n\n"
-        f"{safe_body}\n\n"
-        f'<a href="{safe_url}">Источник</a>'
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE news (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            description TEXT,
+            image_url TEXT,
+            source TEXT,
+            published_at TEXT
+        )
+        """
     )
+    conn.commit()
+    conn.close()
 
 
-# ==========================
-#      JOB: НОВОСТИ
-# ==========================
+def news_exists(url: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM news WHERE url = ?", (url,))
+    found = cur.fetchone() is not None
+    conn.close()
+    return found
 
-async def periodic_news(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Проверяем новости…")
 
-    try:
-        news = fetch_news()
-        if not news:
-            logger.info("Свежих новостей нет.")
-            return
+def save_news(url, title, description, image_url, source, published_at):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO news (url, title, description, image_url, source, published_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (url, title, description, image_url, source, published_at.isoformat())
+    )
+    conn.commit()
+    conn.close()
 
-        count = 0
 
-        for item in news:
-            if count >= MAX_POSTS_PER_RUN:
-                break
+def get_today_news():
+    today_str = date.today().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT title, description, url, source, published_at
+        FROM news
+        WHERE DATE(published_at) = ?
+        ORDER BY published_at ASC
+        """,
+        (today_str,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-            url = item["url"]
-            title = item["title"]
-            summary = item["summary"]
-            image = item["image"]
+# -------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --------------------
 
-            if url in sent_urls:
+def shorten_text(text: str, max_len: int = 280) -> str:
+    text = re.sub(r"<.*?>", "", text)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def split_message(text: str, limit: int = 4000):
+    parts = []
+    while len(text) > limit:
+        cut_pos = text.rfind("\n\n", 0, limit)
+        if cut_pos == -1:
+            cut_pos = limit
+        parts.append(text[:cut_pos])
+        text = text[cut_pos:]
+    parts.append(text)
+    return parts
+
+
+def extract_image(entry):
+    # 1 — media:thumbnail
+    if "media_thumbnail" in entry and entry.media_thumbnail:
+        return entry.media_thumbnail[0].get("url")
+
+    # 2 — media:content
+    if "media_content" in entry and entry.media_content:
+        return entry.media_content[0].get("url")
+
+    # 3 — enclosures
+    if hasattr(entry, "enclosures"):
+        for e in entry.enclosures:
+            if "image" in e.get("type", ""):
+                return e.get("href")
+
+    # 4 — <img> inside summary
+    summary = entry.get("summary", "")
+    m = re.search(r'<img[^>]+src="([^"]+)"', summary)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+# -------------------- ОСНОВНАЯ ЛОГИКА НОВОСТЕЙ --------------------
+
+async def fetch_and_send_news(bot: Bot):
+    logger.info("Проверка новых новостей...")
+    total_new = 0
+
+    for feed in NEWS_FEEDS:
+        source_name = feed["name"]
+        url = feed["url"]
+
+        try:
+            parsed = feedparser.parse(url)
+        except Exception as e:
+            logger.error(f"Ошибка парсинга {url}: {e}")
+            continue
+
+        for entry in parsed.entries:
+            link = entry.get("link")
+            title = entry.get("title", "").strip()
+            description = entry.get("summary") or entry.get("description") or title
+
+            if not link or not title:
                 continue
 
-            body = build_body_text(title, summary)
-            if not body:
-                sent_urls.add(url)
-                save_sent_urls()
+            if news_exists(link):
                 continue
 
-            post = build_post_text(title, body, url)
+            published = datetime.now()
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                try:
+                    published = datetime(
+                        entry.published_parsed.tm_year,
+                        entry.published_parsed.tm_mon,
+                        entry.published_parsed.tm_mday,
+                        entry.published_parsed.tm_hour,
+                        entry.published_parsed.tm_min,
+                        entry.published_parsed.tm_sec,
+                    )
+                except Exception:
+                    pass
+
+            image_url = extract_image(entry)
+
+            short_title = shorten_text(title)
+
+            text = (
+                f"🧠 <b>{short_title}</b>\n"
+                f"<i>{source_name}</i>\n"
+                f"<a href=\"{link}\">Читать полностью</a>"
+            )
 
             try:
-                await context.bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=image,
-                    caption=post,
-                    parse_mode=ParseMode.HTML,
-                )
-                logger.info("Отправлена новость: %s", url)
+                if image_url:
+                    await bot.send_photo(
+                        chat_id=NEWS_CHAT_ID,
+                        photo=image_url,
+                        caption=text,
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=NEWS_CHAT_ID,
+                        text=text,
+                        parse_mode=ParseMode.HTML
+                    )
 
-                sent_urls.add(url)
-                save_sent_urls()
-                count += 1
+                save_news(link, title, description, image_url, source_name, published)
+                total_new += 1
+                await asyncio.sleep(1)
 
             except Exception as e:
-                logger.exception("Ошибка отправки поста: %s", e)
-                await notify_admin(context, f"Ошибка отправки поста: {e}")
+                logger.error(f"Ошибка отправки новости: {e}")
 
-    except Exception as e:
-        logger.exception("Ошибка periodic_news: %s", e)
-        await notify_admin(context, f"Ошибка periodic_news: {e}")
+    logger.info(f"Новых новостей отправлено: {total_new}")
 
 
-# ==========================
-#         HANDLERS
-# ==========================
+async def send_evening_digest(bot: Bot):
+    logger.info("Формирование вечернего дайджеста...")
+    rows = get_today_news()
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
+    if not rows:
+        logger.info("За сегодня нет новостей для дайджеста.")
         return
 
-    await update.effective_chat.send_message(
-        "👋 Привет!\n"
-        "Это бот новостей про Искусственный Интеллект.\n"
-        "✔ Только уникальное описание\n"
-        "✔ Без дублей\n"
-        "✔ С картинками 😎"
+    header = (
+        f"🍔 <b>Вечерний дайджест ИИ-новостей за "
+        f"{date.today().strftime('%d.%m.%Y')}:</b>\n\n"
+    )
+
+    body_lines = []
+    for i, (title, description, url, source, published_at) in enumerate(rows, start=1):
+        desc = description or title
+        short_desc = shorten_text(desc, 300)
+
+        line = (
+            f"{i}. {short_desc}\n"
+            f"<i>{source}</i> — <a href=\"{url}\">Источник</a>\n"
+        )
+        body_lines.append(line)
+
+    full_text = header + "\n".join(body_lines)
+    parts = split_message(full_text)
+
+    try:
+        for part in parts:
+            await bot.send_message(
+                chat_id=NEWS_CHAT_ID,
+                text=part,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            await asyncio.sleep(1)
+        logger.info("Вечерний дайджест отправлен.")
+    except Exception as e:
+        logger.error(f"Ошибка отправки вечернего дайджеста: {e}")
+
+# -------------------- TELEGRAM-БОТ --------------------
+
+router = Router()
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    await message.answer(
+        "👋 Привет! Я бот канала «AI News | ИИ Новости».\n"
+        "Новости публикуются автоматически в канал.\n"
+        "Здесь можно только проверить, что бот работает 🙂"
     )
 
 
-# ==========================
-#          MAIN
-# ==========================
+async def main():
+    init_db()
 
-def main() -> None:
-    logger.info("Запуск ai-news-worker…")
-    load_sent_urls()
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    dp = Dispatcher()
+    dp.include_router(router)
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_handler))
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-    app.job_queue.run_repeating(
-        periodic_news,
-        interval=NEWS_INTERVAL,
-        first=10,
-        name="periodic_news",
+    scheduler.add_job(
+        fetch_and_send_news,
+        IntervalTrigger(minutes=30),
+        args=(bot,),
+        id="fetch_news_job",
+        replace_existing=True
     )
 
-    app.run_polling()
+    scheduler.add_job(
+        send_evening_digest,
+        CronTrigger(hour=21, minute=0),
+        args=(bot,),
+        id="evening_digest_job",
+        replace_existing=True
+    )
+
+    scheduler.start()
+
+    logger.info("Бот запущен.")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
